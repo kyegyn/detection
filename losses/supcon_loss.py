@@ -1,0 +1,104 @@
+import torch
+import torch.nn as nn
+
+
+class SupConLoss(nn.Module):
+    """
+    Supervised Contrastive Learning: https://arxiv.org/pdf/2004.11362.pdf.
+    It allows for multiple positive samples per anchor.
+    """
+
+    def __init__(self, temperature=0.07, contrast_mode='all', base_temperature=0.07):
+        super(SupConLoss, self).__init__()
+        self.temperature = temperature
+        self.contrast_mode = contrast_mode
+        self.base_temperature = base_temperature
+
+    def forward(self, features, labels=None, mask=None):
+        """
+        Args:
+            features: hidden vector of shape [bsz, n_views, ...].
+            labels: ground truth of shape [bsz].
+            mask: contrastive mask of shape [bsz, bsz], mask_{i,j}=1 if sample j
+                  has the same class as sample i. Can be used instead of labels.
+        Returns:
+            A loss scalar.
+        """
+        device = (torch.device('cuda')
+                  if features.is_cuda
+                  else torch.device('cpu'))
+
+        # 如果输入特征只是 [bsz, dim]，这里将其 unsqueeze 为 [bsz, 1, dim] 以兼容多视图逻辑
+        if len(features.shape) < 3:
+            features = features.unsqueeze(1)
+
+        batch_size = features.shape[0]
+
+        # 如果没有提供 Mask，则根据 Labels 生成 Mask
+        if labels is not None and mask is None:
+            labels = labels.contiguous().view(-1, 1)
+            if labels.shape[0] != batch_size:
+                raise ValueError('Num of labels does not match num of features')
+            # mask[i, j] = 1 if labels[i] == labels[j]
+            mask = torch.eq(labels, labels.T).float().to(device)
+        elif mask is None:
+            mask = torch.eye(batch_size, dtype=torch.float32).to(device)
+
+        contrast_count = features.shape[1]  # n_views (通常为 1)
+
+        # 将多视图特征展平: [bsz * n_views, dim]
+        contrast_feature = torch.cat(torch.unbind(features, dim=1), dim=0)
+
+        if self.contrast_mode == 'one':
+            anchor_feature = features[:, 0]
+            anchor_count = 1
+        elif self.contrast_mode == 'all':
+            anchor_feature = contrast_feature
+            anchor_count = contrast_count
+        else:
+            raise ValueError('Unknown mode: {}'.format(self.contrast_mode))
+
+        # --- 核心计算步骤 ---
+
+        # 1. 计算相似度矩阵 (Dot Product / Temperature)
+        # 结果 shape: [bsz * n_views, bsz * n_views]
+        anchor_dot_contrast = torch.div(
+            torch.matmul(anchor_feature, contrast_feature.T),
+            self.temperature
+        )
+
+        # 2. 数值稳定性处理 (Log-Sum-Exp Trick)
+        # 减去每行的最大值，防止 exp 后数值溢出
+        logits_max, _ = torch.max(anchor_dot_contrast, dim=1, keepdim=True)
+        logits = anchor_dot_contrast - logits_max.detach()
+
+        # 3. 构建 Mask
+        # 将 Mask 扩展到多视图维度 (如果 n_views > 1)
+        mask = mask.repeat(anchor_count, contrast_count)
+
+        # 屏蔽掉自己与自己的对比 (对角线置为 0)
+        logits_mask = torch.scatter(
+            torch.ones_like(mask),
+            1,
+            torch.arange(batch_size * anchor_count).view(-1, 1).to(device),
+            0
+        )
+        mask = mask * logits_mask
+
+        # 4. 计算 Log-Probabilities
+        # exp_logits:除了自己以外的所有样本的 exp 值
+        exp_logits = torch.exp(logits) * logits_mask
+
+        # log_prob = logits - log(sum(exp(logits)))
+        log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True) + 1e-6)  # 加 epsilon 防止 log(0)
+
+        # 5. 计算最终 Loss
+        # 只取正样本对 (mask=1) 的 log_prob
+        # mean_log_prob_pos: 每个样本对其所有正样本的平均对数概率
+        mean_log_prob_pos = (mask * log_prob).sum(1) / (mask.sum(1) + 1e-6)
+
+        # Loss = - (temperature_scaling) * mean_log_prob
+        loss = - (self.temperature / self.base_temperature) * mean_log_prob_pos
+        loss = loss.view(anchor_count, batch_size).mean()
+
+        return loss
