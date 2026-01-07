@@ -1,3 +1,6 @@
+import random
+
+import numpy as np
 import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader
@@ -11,8 +14,23 @@ import time
 from models.tsf_net import TSFNet
 from data.dataset import ForensicDataset
 from losses.supcon_loss import SupConLoss
+from utils.fft_utils import seed_everything
 from utils.metrics import BinaryMetrics
 from utils.logger import ExperimentLogger
+
+
+# --- 1. 定义在全局范围 ---
+def worker_init_fn(worker_id):
+    """
+    这个函数必须定义在全局，Windows 才能序列化它。
+    PyTorch 的 DataLoader 会自动处理基础种子，我们只需要取出当前 worker 的种子信息即可。
+    """
+    # 获取 PyTorch 为当前 worker 分配的种子
+    worker_seed = torch.initial_seed() % 2**32
+
+    # 设置 Python 和 NumPy 的种子
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
 
 
 def train():
@@ -29,6 +47,7 @@ def train():
     #     'device': 'cuda' if torch.cuda.is_available() else 'cpu',
     #     'save_path': './checkpoints'
     # }
+    seed_everything(config['seed'])
     exp_name = config.get('exp_name') or f"exp_{time.strftime('%Y%m%d_%H%M%S')}"
     os.makedirs(f"{config['save_path']}/{exp_name}", exist_ok=True)
     logger = ExperimentLogger(log_dir=f"./{config['logs_path']}", experiment_name=exp_name)
@@ -47,9 +66,9 @@ def train():
     val_ds = ForensicDataset(root_dir='Z:/genimage/imagenet_ai_0419_sdv4/val', transform=train_transform)
 
     train_loader = DataLoader(train_ds, batch_size=config['batch_size'], shuffle=True, num_workers=4,
-                              persistent_workers=True, pin_memory=True)
+                              persistent_workers=True, pin_memory=True, worker_init_fn=worker_init_fn)
     val_loader = DataLoader(val_ds, batch_size=config['batch_size'], shuffle=False, num_workers=4,
-                            persistent_workers=True, pin_memory=True)
+                            persistent_workers=True, pin_memory=True, worker_init_fn=worker_init_fn)
 
     # --- 3. 模型初始化 ---
     # 冻结的 CLIP 引擎：仅作为特征提取器
