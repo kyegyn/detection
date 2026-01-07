@@ -6,11 +6,13 @@ from transformers import CLIPVisionModel
 from tqdm import tqdm
 import os
 import yaml
-
+import time
 # 导入你之前定义的模块
 from models.tsf_net import TSFNet
 from data.dataset import ForensicDataset
 from losses.supcon_loss import SupConLoss
+from utils.metrics import BinaryMetrics
+from utils.logger import ExperimentLogger
 
 
 def train():
@@ -27,8 +29,10 @@ def train():
     #     'device': 'cuda' if torch.cuda.is_available() else 'cpu',
     #     'save_path': './checkpoints'
     # }
-    os.makedirs(config['save_path'], exist_ok=True)
-
+    exp_name = config.get('exp_name') or f"exp_{time.strftime('%Y%m%d_%H%M%S')}"
+    os.makedirs(f"{config['save_path']}/{exp_name}", exist_ok=True)
+    logger = ExperimentLogger(log_dir=f"./{config['logs_path']}", experiment_name=exp_name)
+    logger.log_hyperparams(config)
     # --- 2. 数据准备 ---
     # 定义基础增强（注意：不要过度增强以免破坏微观伪影）
     train_transform = transforms.Compose([
@@ -37,41 +41,56 @@ def train():
         transforms.ToTensor(),
         transforms.Normalize((0.4814, 0.4578, 0.4082), (0.2686, 0.2613, 0.2757))  # CLIP 默认归一化
     ])
+    # train_ds = ForensicDataset(root_dir='../data/train', transform=train_transform)
+    train_ds = ForensicDataset(root_dir='Z:/genimage/imagenet_ai_0419_sdv4/train', transform=train_transform)
+    # val_ds = ForensicDataset(root_dir='../data/val', transform=train_transform)
+    val_ds = ForensicDataset(root_dir='Z:/genimage/imagenet_ai_0419_sdv4/val', transform=train_transform)
 
-    train_ds = ForensicDataset(root_dir='../data/train', transform=train_transform)
-    val_ds = ForensicDataset(root_dir='../data/val', transform=train_transform)
-
-    train_loader = DataLoader(train_ds, batch_size=config['batch_size'], shuffle=True, num_workers=4)
-    val_loader = DataLoader(val_ds, batch_size=config['batch_size'], shuffle=False, num_workers=4)
+    train_loader = DataLoader(train_ds, batch_size=config['batch_size'], shuffle=True, num_workers=4,
+                              persistent_workers=True, pin_memory=True)
+    val_loader = DataLoader(val_ds, batch_size=config['batch_size'], shuffle=False, num_workers=4,
+                            persistent_workers=True, pin_memory=True)
 
     # --- 3. 模型初始化 ---
     # 冻结的 CLIP 引擎：仅作为特征提取器
-    clip_v  = CLIPVisionModel.from_pretrained(config['clip_model']).to(config['device'])
-    clip_v .eval()
-    for param in clip_v .parameters():
+    clip_v = CLIPVisionModel.from_pretrained(config['clip_model']).to(config['device'])
+    clip_v.eval()
+    for param in clip_v.parameters():
         param.requires_grad = False
 
     # 我们的 TSF-Net
     model = TSFNet(config).to(config['device'])
-
     # --- 4. 优化器与损失函数 ---
     optimizer = optim.AdamW(model.parameters(), lr=config['lr'], weight_decay=1e-2)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config['epochs'])
+    # --- 【新增】断点续训逻辑 ---
+    resume_epoch = 0  # 默认为 0，表示从头训练
+    resume_path = f"{config['save_path']}/model_epoch_{config['resume_epoch']}.pth"
+    best_val_acc = 0.0
+    # 如果指定了路径，且文件存在
+    if config['resume_epoch'] != resume_epoch and resume_path and os.path.exists(resume_path):
+        logger.log_info(f"🔄 Resuming training from {resume_path}...")
+        checkpoint = torch.load(resume_path, map_location=config['device'], weights_only=True)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])  # 需要先定义 optimizer
+        resume_epoch = checkpoint['epoch']
+        best_val_acc = checkpoint['best_val_acc']
+        logger.log_info(f"👉 Successfully loaded. Resuming from Epoch {resume_epoch + 1}")
 
     criterion_bce = torch.nn.BCEWithLogitsLoss()
     criterion_supcon = SupConLoss(temperature=config['temp'])
 
     # --- 5. 训练循环 ---
-    best_val_acc = 0.0
 
-    for epoch in range(config['epochs']):
+    for epoch in range(resume_epoch, config['epochs']):
         model.train()
         train_loss = 0.0
         correct = 0
         total = 0
 
         loop = tqdm(train_loader, leave=True)
-        for imgs, labels in loop:
+        for batch_idx, (imgs, labels) in enumerate(loop):
+
             imgs, labels = imgs.to(config['device']), labels.to(config['device']).float()
 
             # A. 预提取 CLIP 特征 (不计梯度)
@@ -88,9 +107,31 @@ def train():
 
             # D. 反向传播
             optimizer.zero_grad()
+            # 计算 global_step 用于 tensorboard x轴
+            global_step = epoch * len(train_loader) + batch_idx
+
+            # 构造 Loss 字典 (这就是监控多任务平衡的关键)
+            losses_dict = {
+                'total': total_loss.item(),
+                'bce': loss_bce.item(),
+                'supcon': loss_sc.item()  # 观察这个，看聚类是否生效
+            }
+
+            # 记录
+            logger.log_step(epoch, batch_idx, global_step, losses_dict)
             total_loss.backward()
             optimizer.step()
-
+            # 放在 train.py 的循环里
+            if batch_idx % 100 == 0:
+                # 1. 获取显存指标 (转换为 GB)
+                mem_alloc = torch.cuda.memory_allocated() / 1024 ** 3
+                mem_res = torch.cuda.memory_reserved() / 1024 ** 3
+                mem_peak = torch.cuda.max_memory_allocated() / 1024 ** 3
+                # 2. 【关键】重置峰值统计
+                # 这样下一次 loop 看到的 peak 就是未来这 50 个 batch 里的新峰值
+                torch.cuda.reset_peak_memory_stats()
+                mem_info = f"Mem: {mem_alloc:.2f}G(A) / {mem_res:.2f}G(R) / {mem_peak:.2f}G(P)"
+                logger.log_info(f"Epoch [{epoch + 1}] Step [{batch_idx}] Loss: {total_loss.item():.4f} | {mem_info}")
             # 统计
             train_loss += total_loss.item()
             preds = (torch.sigmoid(logits).squeeze() > 0.5).float()
@@ -103,28 +144,65 @@ def train():
         scheduler.step()
 
         # --- 6. 验证环节 ---
-        val_acc = validate(model, clip_v, val_loader, config)
-        print(f"Epoch {epoch + 1} Val Acc: {val_acc:.4f}")
+        metrics = validate(model, clip_v, val_loader, config)
+        logger.log_info(f"Epoch {epoch + 1} Val Acc: {metrics['Acc']:.4f}")
+        # 获取当前 LR
+        current_lr = optimizer.param_groups[0]['lr']
 
-        # 保存最优模型
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            torch.save(model.state_dict(), f"{config['save_path']}/best_model.pth")
+        # 构造 epoch 级指标
+        train_epoch_metrics = {'loss': train_loss / len(train_loader)}  # 可以加 train_acc
+
+        # 记录日志 (metrics 是 validate 返回的那个丰富字典)
+        logger.log_epoch(epoch + 1, train_epoch_metrics, metrics, current_lr)
+
+        # 保存当前 Epoch 的权重
+        current_save_path = f"{config['save_path']}/model_epoch_{epoch + 1}.pth"
+        # 推荐的保存方式 (保存更多元数据)
+        checkpoint_dict = {
+            'epoch': epoch + 1,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),  # 恢复动量等信息
+            'best_val_acc': best_val_acc
+        }
+        torch.save(checkpoint_dict, current_save_path)
+        # 打印一条日志方便确认
+        logger.log_info(f"Saved checkpoint to {current_save_path}")
+        # 根据 EER 或 Acc 保存模型
+        if metrics['Acc'] > best_val_acc:
+            best_val_acc = metrics['Acc']
+            logger.log_info(f"🔥 New Best Model saved with Acc: {best_val_acc:.4f} at Epoch [{epoch + 1}]")
+            # torch.save(model.state_dict(), f"{config['save_path']}/best_model.pth")
 
 
-def validate(model, clip_v, val_loader, config):
+def validate(model, clip_engine, val_loader, config):
     model.eval()
-    correct = 0
-    total = 0
+
+    # 初始化指标计算器
+    evaluator = BinaryMetrics()
+
     with torch.no_grad():
         for imgs, labels in val_loader:
-            imgs, labels = imgs.to(config['device']), labels.to(config['device']).float()
-            clip_out = clip_v(pixel_values=imgs).pooler_output
-            logits, _, _ = model(imgs, clip_out)
-            preds = (torch.sigmoid(logits).squeeze() > 0.5).float()
-            correct += (preds == labels).sum().item()
-            total += labels.size(0)
-    return correct / total
+            imgs = imgs.to(config['device'])
+            labels = labels.to(config['device']).float()
+
+            # 1. 获取特征
+            vision_outputs = clip_engine.vision_model(pixel_values=imgs)
+            clip_out = vision_outputs.pooler_output
+
+            # 2. 推理
+            logits, z_sem, _ = model(imgs, clip_out)
+
+            # 3. 将结果喂给评估器 (只需 logits 和 labels)
+            evaluator.update(logits.squeeze(), labels)
+
+    # 4. 计算并打印报告
+    metrics = evaluator.print_report()
+
+    # 5. (可选) 保存 ROC 曲线
+    # evaluator.plot_roc(save_path=f"{config['save_path']}/val_roc.png")
+
+    # 返回主要指标用于 Model Checkpoint (通常用 Accuracy 或 AUC)
+    return metrics
 
 
 if __name__ == "__main__":

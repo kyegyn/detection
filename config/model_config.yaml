@@ -5,9 +5,12 @@ patch_size: 32
 embed_dim: 256
 
 device: 'cuda'
-batch_size: 64
+batch_size: 128
 lr: 0.0001
 epochs: 50
 temp: 0.07  # SupCon 温度系数
 lambda_supcon: 0.5 # 语义聚类损失权重
 save_path: './checkpoints'
+logs_path: './logs'
+resume_epoch: 0 # 举例：你想从第 {resume_epoch} epoch 继续，{不包括resume_epoch}，{从resume_epoch}+1开始;重新开始为0
+#exp_name:

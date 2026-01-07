@@ -1,3 +1,4 @@
-/data/train
-/data/val
-/scripts/checkpoints
+/data/train/
+/data/val/
+/scripts/checkpoints/
+/scripts/logs/
