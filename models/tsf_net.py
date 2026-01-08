@@ -14,7 +14,7 @@ class TSFNet(nn.Module):
     """
 
     def __init__(self, config):
-        super().__init__()
+        super(TSFNet, self).__init__()
 
         # --- 1. 实例化三大支路 ---
         # 支路一：语义流 (CLIP)

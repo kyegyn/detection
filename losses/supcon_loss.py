@@ -90,7 +90,7 @@ class SupConLoss(nn.Module):
         exp_logits = torch.exp(logits) * logits_mask
 
         # log_prob = logits - log(sum(exp(logits)))
-        log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True) + 1e-6)  # 加 epsilon 防止 log(0)
+        log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True))  # 加 epsilon 防止 log(0)
 
         # 5. 计算最终 Loss
         # 只取正样本对 (mask=1) 的 log_prob

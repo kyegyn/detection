@@ -1,5 +1,5 @@
-clip_model: "openai/clip-vit-base-patch32"
-clip_dim: 512
+  clip_model: "openai/clip-vit-base-patch32"
+#clip_dim: 512
 projection_dim: 256
 patch_size: 32
 embed_dim: 256

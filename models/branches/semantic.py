@@ -25,7 +25,8 @@ class SemanticBranch(nn.Module):
             nn.LayerNorm(self.clip_dim),
             nn.GELU(),
             nn.Dropout(0.1),
-            nn.Linear(self.clip_dim, projection_dim)
+            nn.Linear(self.clip_dim, projection_dim),
+            nn.LayerNorm(projection_dim)
         )
 
         # 3. 冻结策略
