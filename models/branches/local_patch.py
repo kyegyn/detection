@@ -10,7 +10,7 @@ class LocalPatchBranch(nn.Module):
     功能：通过 Patch 打乱（Shuffle）破坏全局语义，利用 CNN 提取局部伪影特征。
     """
 
-    def __init__(self, patch_size=32, embed_dim=256, pretrained=True):
+    def __init__(self, patch_size=32, embed_dim=256, pretrained=False):
         super(LocalPatchBranch, self).__init__()
         self.patch_size = patch_size
 

@@ -19,7 +19,7 @@ class ExperimentLogger:
         os.makedirs(self.save_dir, exist_ok=True)
         os.makedirs(self.tb_dir, exist_ok=True)
 
-        # --- 1. 初始化 Python 标准 Logger ---
+        # --- 1. 初始化主 Logger (输出到所有地方) ---
         self.logger = logging.getLogger("TSF-Net")
         self.logger.setLevel(logging.INFO)
         self.logger.handlers = []  # 防止重复添加 handler
@@ -37,11 +37,20 @@ class ExperimentLogger:
         sh.setFormatter(formatter)
         self.logger.addHandler(sh)
 
+        # --- 【新增】初始化静默 Logger (只输出到文件) ---
+        # 技巧：我们复用上面的 fh (FileHandler)，这样它们会写到同一个文件里，且格式一致
+        self.file_logger = logging.getLogger("TSF-Net-FileOnly")
+        self.file_logger.setLevel(logging.INFO)
+        self.file_logger.handlers = [] # 清空默认
+        self.file_logger.propagate = False # 关键：防止它把消息传给父级 logger 导致打印到控制台
+        self.file_logger.addHandler(fh) # 只添加文件 Handler
+
         # --- 2. 初始化 TensorBoard ---
         self.writer = SummaryWriter(log_dir=self.tb_dir)
 
         self.logger.info(f"🚀 Experiment initialized at: {self.save_dir}")
 
+    # ... (log_hyperparams, log_step, log_epoch 方法保持不变) ...
     def log_hyperparams(self, config):
         """记录超参数配置"""
         self.logger.info("=== Hyperparameters ===")
@@ -80,13 +89,21 @@ class ExperimentLogger:
         self.writer.add_scalar('Hyperparams/Learning_Rate', lr, epoch)
 
     def log_info(self, msg):
-        """通用 info 记录"""
+        """通用 info 记录 (控制台 + 文件)"""
         self.logger.info(msg)
+
+    # --- 【新增】只记录到文件的方法 ---
+    def log_file_only(self, msg):
+        """仅记录到文件，不干扰控制台进度条"""
+        self.file_logger.info(msg)
 
     def close(self):
         """关闭资源"""
         self.writer.close()
-        # 移除 handlers 防止内存泄漏
         for handler in self.logger.handlers:
             handler.close()
             self.logger.removeHandler(handler)
+        # 别忘了清理 file_logger 的 handler
+        for handler in self.file_logger.handlers:
+            handler.close()
+            self.file_logger.removeHandler(handler)

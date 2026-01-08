@@ -3,3 +3,4 @@
 /scripts/checkpoints/
 /scripts/logs/
 /.idea/
+/models/clip-vit-base-patch32/

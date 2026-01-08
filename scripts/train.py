@@ -5,11 +5,25 @@ import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torchvision import transforms
-from transformers import CLIPVisionModel
 from tqdm import tqdm
 import os
 import yaml
 import time
+import sys
+
+# 1. 获取当前脚本的绝对路径 (例如: /root/.../detection/scripts/train.py)
+current_path = os.path.abspath(__file__)
+
+# 2. 获取当前脚本所在的目录 (例如: /root/.../detection/scripts)
+script_dir = os.path.dirname(current_path)
+
+# 3. 获取项目的根目录，即 scripts 的上一级 (例如: /root/.../detection)
+project_root = os.path.dirname(script_dir)
+
+# 4. 将项目根目录添加到系统路径中，这样就能找到 models 了
+if project_root not in sys.path:
+    sys.path.append(project_root)
+
 # 导入你之前定义的模块
 from models.tsf_net import TSFNet
 from data.dataset import ForensicDataset
@@ -36,17 +50,8 @@ def worker_init_fn(worker_id):
 def train():
     # --- 1. 加载配置 ---
     # 实际项目中建议使用 yaml.safe_load(open("configs/config.yaml"))
-    config = yaml.safe_load(open("../config/model_config.yaml", 'r', encoding='utf-8'))
-    # config = {
-    #     'clip_model': "openai/clip-vit-base-patch32",
-    #     'batch_size': 32,  # 根据显存调整，SupCon 建议越大越好
-    #     'lr': 1e-4,
-    #     'epochs': 50,
-    #     'temp': 0.07,
-    #     'lambda_supcon': 0.5,
-    #     'device': 'cuda' if torch.cuda.is_available() else 'cpu',
-    #     'save_path': './checkpoints'
-    # }
+    # config = yaml.safe_load(open("../config/model_config.yaml", 'r', encoding='utf-8'))
+    config = yaml.safe_load(open("/root/autodl-tmp/detection/config/model_config.yaml", 'r', encoding='utf-8'))
     seed_everything(config['seed'])
     exp_name = config.get('exp_name') or f"exp_{time.strftime('%Y%m%d_%H%M%S')}"
     os.makedirs(f"{config['save_path']}/{exp_name}", exist_ok=True)
@@ -60,27 +65,24 @@ def train():
         transforms.ToTensor(),
         transforms.Normalize((0.4814, 0.4578, 0.4082), (0.2686, 0.2613, 0.2757))  # CLIP 默认归一化
     ])
-    # train_ds = ForensicDataset(root_dir='../data/train', transform=train_transform)
-    train_ds = ForensicDataset(root_dir='Z:/genimage/imagenet_ai_0419_sdv4/train', transform=train_transform)
-    # val_ds = ForensicDataset(root_dir='../data/val', transform=train_transform)
-    val_ds = ForensicDataset(root_dir='Z:/genimage/imagenet_ai_0419_sdv4/val', transform=train_transform)
+    train_ds = ForensicDataset(root_dir='/root/autodl-tmp/data/train', transform=train_transform)
+    # train_ds = ForensicDataset(root_dir='Z:/genimage/imagenet_ai_0419_sdv4/train', transform=train_transform)
+    val_ds = ForensicDataset(root_dir='/root/autodl-tmp/data/val', transform=train_transform)
+    # val_ds = ForensicDataset(root_dir='Z:/genimage/imagenet_ai_0419_sdv4/val', transform=train_transform)
 
     train_loader = DataLoader(train_ds, batch_size=config['batch_size'], shuffle=True, num_workers=4,
                               persistent_workers=True, pin_memory=True, worker_init_fn=worker_init_fn)
     val_loader = DataLoader(val_ds, batch_size=config['batch_size'], shuffle=False, num_workers=4,
                             persistent_workers=True, pin_memory=True, worker_init_fn=worker_init_fn)
 
-    # --- 3. 模型初始化 ---
-    # 冻结的 CLIP 引擎：仅作为特征提取器
-    clip_v = CLIPVisionModel.from_pretrained(config['clip_model']).to(config['device'])
-    clip_v.eval()
-    for param in clip_v.parameters():
-        param.requires_grad = False
-
     # 我们的 TSF-Net
     model = TSFNet(config).to(config['device'])
     # --- 4. 优化器与损失函数 ---
-    optimizer = optim.AdamW(model.parameters(), lr=config['lr'], weight_decay=1e-2)
+    optimizer = optim.AdamW(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=config['lr'],
+        weight_decay=1e-2
+    )
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config['epochs'])
     # --- 【新增】断点续训逻辑 ---
     resume_epoch = 0  # 默认为 0，表示从头训练
@@ -112,12 +114,8 @@ def train():
 
             imgs, labels = imgs.to(config['device']), labels.to(config['device']).float()
 
-            # A. 预提取 CLIP 特征 (不计梯度)
-            with torch.no_grad():
-                clip_out = clip_v(pixel_values=imgs).pooler_output  # [B, 768]
-
-            # B. 前向传播
-            logits, z_sem, _ = model(imgs, clip_out)
+            # 直接把图扔给模型，模型内部会处理 CLIP (包括 LoRA 的梯度更新)
+            logits, z_sem, _ = model(imgs)
 
             # C. 计算复合损失
             loss_bce = criterion_bce(logits.squeeze(), labels)
@@ -140,6 +138,11 @@ def train():
             logger.log_step(epoch, batch_idx, global_step, losses_dict)
             total_loss.backward()
             optimizer.step()
+            # 统计
+            train_loss += total_loss.item()
+            preds = (torch.sigmoid(logits).squeeze() > 0.5).float()
+            correct += (preds == labels).sum().item()
+            total += labels.size(0)
             # 放在 train.py 的循环里
             if batch_idx % 100 == 0:
                 # 1. 获取显存指标 (转换为 GB)
@@ -150,12 +153,7 @@ def train():
                 # 这样下一次 loop 看到的 peak 就是未来这 50 个 batch 里的新峰值
                 torch.cuda.reset_peak_memory_stats()
                 mem_info = f"Mem: {mem_alloc:.2f}G(A) / {mem_res:.2f}G(R) / {mem_peak:.2f}G(P)"
-                logger.log_info(f"Epoch [{epoch + 1}] Step [{batch_idx}] Loss: {total_loss.item():.4f} | {mem_info}")
-            # 统计
-            train_loss += total_loss.item()
-            preds = (torch.sigmoid(logits).squeeze() > 0.5).float()
-            correct += (preds == labels).sum().item()
-            total += labels.size(0)
+                logger.log_file_only(f"Epoch [{epoch + 1}] Step [{batch_idx}] Loss: {total_loss.item():.4f} | Acc: {correct / total} | {mem_info}")
 
             loop.set_description(f"Epoch [{epoch + 1}/{config['epochs']}]")
             loop.set_postfix(loss=total_loss.item(), acc=correct / total)
@@ -163,8 +161,8 @@ def train():
         scheduler.step()
 
         # --- 6. 验证环节 ---
-        metrics = validate(model, clip_v, val_loader, config)
-        logger.log_info(f"Epoch {epoch + 1} Val Acc: {metrics['Acc']:.4f}")
+        metrics = validate(model, val_loader, config)
+        logger.log_file_only(f"Epoch {epoch + 1} Val Acc: {metrics['Acc']:.4f}")
         # 获取当前 LR
         current_lr = optimizer.param_groups[0]['lr']
 
@@ -175,7 +173,7 @@ def train():
         logger.log_epoch(epoch + 1, train_epoch_metrics, metrics, current_lr)
 
         # 保存当前 Epoch 的权重
-        current_save_path = f"{config['save_path']}/model_epoch_{epoch + 1}.pth"
+        current_save_path = f"{config['save_path']}/{exp_name}/model_epoch_{epoch + 1}.pth"
         # 推荐的保存方式 (保存更多元数据)
         checkpoint_dict = {
             'epoch': epoch + 1,
@@ -185,15 +183,15 @@ def train():
         }
         torch.save(checkpoint_dict, current_save_path)
         # 打印一条日志方便确认
-        logger.log_info(f"Saved checkpoint to {current_save_path}")
+        logger.log_file_only(f"Saved checkpoint to {current_save_path}")
         # 根据 EER 或 Acc 保存模型
         if metrics['Acc'] > best_val_acc:
             best_val_acc = metrics['Acc']
-            logger.log_info(f"🔥 New Best Model saved with Acc: {best_val_acc:.4f} at Epoch [{epoch + 1}]")
+            logger.log_file_only(f"🔥 New Best Model saved with Acc: {best_val_acc:.4f} at Epoch [{epoch + 1}]")
             # torch.save(model.state_dict(), f"{config['save_path']}/best_model.pth")
 
 
-def validate(model, clip_engine, val_loader, config):
+def validate(model, val_loader, config):
     model.eval()
 
     # 初始化指标计算器
@@ -204,14 +202,8 @@ def validate(model, clip_engine, val_loader, config):
             imgs = imgs.to(config['device'])
             labels = labels.to(config['device']).float()
 
-            # 1. 获取特征
-            vision_outputs = clip_engine.vision_model(pixel_values=imgs)
-            clip_out = vision_outputs.pooler_output
+            logits, z_sem, _ = model(imgs)
 
-            # 2. 推理
-            logits, z_sem, _ = model(imgs, clip_out)
-
-            # 3. 将结果喂给评估器 (只需 logits 和 labels)
             evaluator.update(logits.squeeze(), labels)
 
     # 4. 计算并打印报告
@@ -225,4 +217,7 @@ def validate(model, clip_engine, val_loader, config):
 
 
 if __name__ == "__main__":
+    # os.environ["http_proxy"] = "http://127.0.0.1:7890"
+    # os.environ["https_proxy"] = "http://127.0.0.1:7890"
+    os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
     train()
