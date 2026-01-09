@@ -4,7 +4,7 @@ projection_dim: 256
 patch_size: 32
 embed_dim: 256
 
-seed: 42
+seed: 3407 # 42
 device: 'cuda'
 batch_size: 512   # 128
 lr: 0.0004        # 0.0001
@@ -15,3 +15,11 @@ save_path: './checkpoints'
 logs_path: './logs'
 resume_epoch: 0 # 举例：你想从第 {resume_epoch} epoch 继续，{不包括resume_epoch}，{从resume_epoch}+1开始;重新开始为0
 #exp_name:
+
+# 推理：
+# 验证集目录，多个用','隔开
+VAL_DIRS: "/root/autodl-tmp/data/val,/root/autodl-tmp/adm/val,/root/autodl-tmp/biggan/val,/root/autodl-tmp/glide/val,/root/autodl-tmp/midjourney/val,/root/autodl-tmp/sdv5/val,/root/autodl-tmp/vqdm/val,/root/autodl-tmp/wukong/val"
+# 模型权重目录，默认目录下所有权重文件，
+CHECKPOINT_DIR: "/root/autodl-tmp/detection/checkpoints/exp_20260109_001435_3407"
+# 模型权重目录下的epoch权重，只使用这一个，注释掉使用所有
+CHECKPOINT_EPOCH: 40
