@@ -4,3 +4,5 @@
 /scripts/logs/
 /.idea/
 /models/clip-vit-base-patch32/
+__pycache__/
+*.py[cod]
