@@ -31,6 +31,7 @@ from losses.supcon_loss import SupConLoss
 from utils.fft_utils import seed_everything
 from utils.metrics import BinaryMetrics
 from utils.logger import ExperimentLogger
+from models.fusion import OrthogonalLoss
 
 
 # --- 1. 定义在全局范围 ---
@@ -100,7 +101,10 @@ def train():
 
     criterion_bce = torch.nn.BCEWithLogitsLoss()
     criterion_supcon = SupConLoss(temperature=config['temp'])
-
+    # 初始化损失函数
+    criterion_bce = torch.nn.BCEWithLogitsLoss()
+    criterion_supcon = SupConLoss(temperature=config['temp'])
+    criterion_orth = OrthogonalLoss() # 【新增】
     # --- 5. 训练循环 ---
 
     for epoch in range(resume_epoch, config['epochs']):
@@ -114,13 +118,19 @@ def train():
 
             imgs, labels = imgs.to(config['device']), labels.to(config['device']).float()
 
-            # 直接把图扔给模型，模型内部会处理 CLIP (包括 LoRA 的梯度更新)
-            logits, z_sem, _ = model(imgs)
-
+            # 【修改】接收 5 个返回值
+            logits, z_sem, _, f_sem_raw, v_forensic = model(imgs)
             # C. 计算复合损失
             loss_bce = criterion_bce(logits.squeeze(), labels)
             loss_sc = criterion_supcon(z_sem, labels)
             total_loss = loss_bce + config['lambda_supcon'] * loss_sc
+            # 2. 【新增】根据配置计算额外损失
+            loss_orth_val = 0.0
+            # 只有在 'gating' 模式下才加正交损失 (情况2)
+            if config.get('fusion_type') == 'gating':
+                loss_orth_val = criterion_orth(f_sem_raw, v_forensic)
+                total_loss += config.get('lambda_orth', 0.1) * loss_orth_val
+
 
             # D. 反向传播
             optimizer.zero_grad()
@@ -131,7 +141,8 @@ def train():
             losses_dict = {
                 'total': total_loss.item(),
                 'bce': loss_bce.item(),
-                'supcon': loss_sc.item()  # 观察这个，看聚类是否生效
+                'supcon': loss_sc.item(),  # 观察这个，看聚类是否生效
+                'orth': loss_orth_val.item() if isinstance(loss_orth_val, torch.Tensor) else 0.0
             }
 
             # 记录
@@ -202,7 +213,7 @@ def validate(model, val_loader, config):
             imgs = imgs.to(config['device'])
             labels = labels.to(config['device']).float()
 
-            logits, z_sem, _ = model(imgs)
+            logits, z_sem, _, _, _ = model(imgs)
 
             evaluator.update(logits.squeeze(), labels)
 

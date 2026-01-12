@@ -5,7 +5,7 @@ import torch.nn as nn
 from .branches.semantic import SemanticBranch
 from .branches.local_patch import LocalPatchBranch
 from .branches.global_freq import GlobalFreqBranch
-from .fusion import CrossAttentionFusion, FinalClassifier
+from .fusion import CrossAttentionFusion, FinalClassifier, DiscrepancyFusion, GatingFusion
 
 
 class TSFNet(nn.Module):
@@ -19,11 +19,11 @@ class TSFNet(nn.Module):
             config: 字典，包含 'clip_model', 'use_lora', 'lora_r' 等所有配置
         """
         super(TSFNet, self).__init__()
-
+        self.config = config
         # --- 1. 实例化三大支路 ---
         # 支路一：语义流 (CLIP) - 内部处理加载与 LoRA
         self.branch1 = SemanticBranch(config)
-
+        embed_dim = config['embed_dim']
         # 支路二：局部纹理流 (Patch Shuffle)
         self.branch2 = LocalPatchBranch(
             patch_size=config['patch_size'],
@@ -40,13 +40,28 @@ class TSFNet(nn.Module):
             embed_dim=config['embed_dim'],
             num_heads=8
         )
+        # --- 3. 高级融合策略选择 (Switch) ---
+        # 默认为 'concat' (老方法), 可选 'discrepancy' (情况1), 'gating' (情况2)
+        self.fusion_type = config.get('fusion_type', 'concat')
+
+        if self.fusion_type == 'discrepancy':
+            print("🚀 Using Strategy 1: Discrepancy-Aware Fusion")
+            self.adv_fusion = DiscrepancyFusion(dim=embed_dim)
+            cls_input_dim = embed_dim # 融合后维度保持为 D
+
+        elif self.fusion_type == 'gating':
+            print("🚀 Using Strategy 2: Dynamic Gating Fusion")
+            self.adv_fusion = GatingFusion(dim=embed_dim)
+            cls_input_dim = embed_dim # 融合后维度保持为 D
+
+        else:
+            print("🚀 Using Default Strategy: Concatenation")
+            self.adv_fusion = None
+            cls_input_dim = embed_dim + config['projection_dim'] # 拼接后维度 D + D
+
 
         # --- 3. 实例化分类头 ---
-        self.classifier = FinalClassifier(
-            semantic_dim=config['projection_dim'],
-            forensic_dim=config['embed_dim'],
-            hidden_dim=256
-        )
+        self.classifier = FinalClassifier(input_dim=cls_input_dim, hidden_dim=256)
 
     def forward(self, img):
         """
@@ -69,9 +84,20 @@ class TSFNet(nn.Module):
         z_freq = self.branch3(img)
 
         # --- Step 4: 交叉注意力融合 ---
-        v_forensic, attn_weights = self.fusion(f_loc, z_freq)
+        v_forensic, attn_weights, x_seq = self.fusion(f_loc, z_freq)
+        # 3. 最终融合决策 (Strategy Switch)
+        if self.fusion_type == 'discrepancy':
+            # 情况1：传入 语义向量 + 取证序列特征
+            final_feat = self.adv_fusion(f_sem_raw, x_seq)
 
+        elif self.fusion_type == 'gating':
+            # 情况2：传入 语义向量 + 取证聚合向量
+            final_feat = self.adv_fusion(f_sem_raw, v_forensic)
+
+        else:
+            # 默认：简单拼接
+            final_feat = torch.cat([f_sem_raw, v_forensic], dim=1)
         # --- Step 5: 最终分类 ---
-        logits = self.classifier(f_sem_raw, v_forensic)
+        logits = self.classifier(final_feat)
 
-        return logits, z_sem_norm, attn_weights
+        return logits, z_sem_norm, attn_weights, f_sem_raw, v_forensic

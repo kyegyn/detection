@@ -122,7 +122,7 @@ def evaluate_on_val(model, val_loader, config):
         for imgs, labels in val_loader:
             imgs = imgs.to(config['device'])
             labels = labels.to(config['device']).float()
-            logits, z_sem, _ = model(imgs)
+            logits, z_sem, _, _, _ = model(imgs)
             evaluator.update(logits.squeeze(), labels)
 
     metrics = evaluator.print_report()
