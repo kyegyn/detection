@@ -15,6 +15,7 @@ save_path: './checkpoints'
 logs_path: './logs'
 resume_epoch: 0 # 举例：你想从第 {resume_epoch} epoch 继续，{不包括resume_epoch}，{从resume_epoch}+1开始;重新开始为0
 #exp_name:
+use_lora: True
 # 可选值: 'concat' | 'discrepancy' | 'gating'
 fusion_type: 'gating'
 # 正交损失权重 (仅在 gating 模式下生效)

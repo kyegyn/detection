@@ -10,6 +10,8 @@ import os
 import yaml
 import time
 import sys
+from PIL import Image
+from io import BytesIO
 
 # 1. 获取当前脚本的绝对路径 (例如: /root/.../detection/scripts/train.py)
 current_path = os.path.abspath(__file__)
@@ -48,13 +50,27 @@ def worker_init_fn(worker_id):
     random.seed(worker_seed)
 
 
+class RandomJPEGCompression(object):
+    def __init__(self, quality_range=(50, 90)):
+        self.quality_range = quality_range
+
+    def __call__(self, img):
+        # 随机选择一个压缩质量
+        quality = random.randint(*self.quality_range)
+
+        # 在内存中进行 JPEG 压缩与解压
+        output_buffer = BytesIO()
+        img.save(output_buffer, format='JPEG', quality=quality)
+        output_buffer.seek(0)
+        return Image.open(output_buffer)
+
 def train():
     # --- 1. 加载配置 ---
     # 实际项目中建议使用 yaml.safe_load(open("configs/config.yaml"))
     # config = yaml.safe_load(open("../config/model_config.yaml", 'r', encoding='utf-8'))
     config = yaml.safe_load(open("/root/autodl-tmp/detection/config/model_config.yaml", 'r', encoding='utf-8'))
     seed_everything(config['seed'])
-    exp_name = config.get('exp_name') or f"exp_{time.strftime('%Y%m%d_%H%M%S')}"
+    exp_name = config.get('exp_name') or f"exp_{time.strftime('%Y%m%d_%H%M%S')}_seed{config['seed']}"
     os.makedirs(f"{config['save_path']}/{exp_name}", exist_ok=True)
     logger = ExperimentLogger(log_dir=f"./{config['logs_path']}", experiment_name=exp_name)
     logger.log_hyperparams(config)
@@ -63,6 +79,15 @@ def train():
     train_transform = transforms.Compose([
         transforms.Resize((224, 224)),
         transforms.RandomHorizontalFlip(),
+        # A. 随机高斯模糊 (模拟对焦不准或运动模糊)
+        transforms.RandomApply([
+            transforms.GaussianBlur(kernel_size=(3, 3), sigma=(0.1, 3.0))
+        ], p=0.1),
+
+        # B. 随机 JPEG 压缩 (模拟社交媒体压缩)
+        transforms.RandomApply([
+            RandomJPEGCompression(quality_range=(30, 100))
+        ], p=0.1),
         transforms.ToTensor(),
         transforms.Normalize((0.4814, 0.4578, 0.4082), (0.2686, 0.2613, 0.2757))  # CLIP 默认归一化
     ])

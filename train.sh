@@ -7,7 +7,7 @@ NC='\033[0m' # No Color
 
 # 打印开始提示
 echo -e "${GREEN}开始执行训练脚本...${NC}"
-
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # 执行核心命令
 /root/miniconda3/bin/conda run -n myenv --no-capture-output python scripts/train.py
 
