@@ -12,6 +12,7 @@ import time
 import sys
 from PIL import Image
 from io import BytesIO
+from torch.cuda.amp import autocast, GradScaler
 
 # 1. 获取当前脚本的绝对路径 (例如: /root/.../detection/scripts/train.py)
 current_path = os.path.abspath(__file__)
@@ -112,7 +113,7 @@ def train():
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config['epochs'])
     # --- 【新增】断点续训逻辑 ---
     resume_epoch = 0  # 默认为 0，表示从头训练
-    resume_path = f"{config['save_path']}/model_epoch_{config['resume_epoch']}.pth"
+    resume_path = f"{config['save_path']}/{exp_name}/model_epoch_{config['resume_epoch']}.pth"
     best_val_acc = 0.0
     # 如果指定了路径，且文件存在
     if config['resume_epoch'] != resume_epoch and resume_path and os.path.exists(resume_path):
@@ -124,12 +125,13 @@ def train():
         best_val_acc = checkpoint['best_val_acc']
         logger.log_info(f"👉 Successfully loaded. Resuming from Epoch {resume_epoch + 1}")
 
-    criterion_bce = torch.nn.BCEWithLogitsLoss()
-    criterion_supcon = SupConLoss(temperature=config['temp'])
     # 初始化损失函数
     criterion_bce = torch.nn.BCEWithLogitsLoss()
     criterion_supcon = SupConLoss(temperature=config['temp'])
     criterion_orth = OrthogonalLoss() # 【新增】
+
+    scaler = GradScaler()
+
     # --- 5. 训练循环 ---
 
     for epoch in range(resume_epoch, config['epochs']):
@@ -143,22 +145,29 @@ def train():
 
             imgs, labels = imgs.to(config['device']), labels.to(config['device']).float()
 
-            # 【修改】接收 5 个返回值
-            logits, z_sem, _, f_sem_raw, v_forensic = model(imgs)
-            # C. 计算复合损失
-            loss_bce = criterion_bce(logits.squeeze(), labels)
-            loss_sc = criterion_supcon(z_sem, labels)
-            total_loss = loss_bce + config['lambda_supcon'] * loss_sc
-            # 2. 【新增】根据配置计算额外损失
-            loss_orth_val = 0.0
-            # 只有在 'gating' 模式下才加正交损失 (情况2)
-            if config.get('fusion_type') == 'gating':
-                loss_orth_val = criterion_orth(f_sem_raw, v_forensic)
-                total_loss += config.get('lambda_orth', 0.1) * loss_orth_val
-
-
-            # D. 反向传播
             optimizer.zero_grad()
+
+            with autocast():
+                # 【修改】接收 5 个返回值
+                logits, z_sem, _, f_sem_raw, v_forensic = model(imgs)
+                # C. 计算复合损失
+                loss_bce = criterion_bce(logits.squeeze(), labels)
+                loss_sc = criterion_supcon(z_sem, labels)
+                total_loss = loss_bce + config['lambda_supcon'] * loss_sc
+                # 2. 【新增】根据配置计算额外损失
+                loss_orth_val = 0.0
+                # 只有在 'gating' 模式下才加正交损失 (情况2)
+                if config.get('fusion_type') == 'gating':
+                    loss_orth_val = criterion_orth(f_sem_raw, v_forensic)
+                    total_loss += config.get('lambda_orth', 0.1) * loss_orth_val
+
+
+            # # D. 反向传播
+            # optimizer.zero_grad()
+            # 4. 使用 Scaler 进行反向传播
+            scaler.scale(total_loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
             # 计算 global_step 用于 tensorboard x轴
             global_step = epoch * len(train_loader) + batch_idx
 
@@ -172,9 +181,10 @@ def train():
 
             # 记录
             logger.log_step(epoch, batch_idx, global_step, losses_dict)
-            total_loss.backward()
-            optimizer.step()
+            # total_loss.backward()
+            # optimizer.step()
             # 统计
+
             train_loss += total_loss.item()
             preds = (torch.sigmoid(logits).squeeze() > 0.5).float()
             correct += (preds == labels).sum().item()
