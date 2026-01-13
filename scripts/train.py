@@ -12,7 +12,7 @@ import time
 import sys
 from PIL import Image
 from io import BytesIO
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 
 # 1. 获取当前脚本的绝对路径 (例如: /root/.../detection/scripts/train.py)
 current_path = os.path.abspath(__file__)
@@ -130,7 +130,7 @@ def train():
     criterion_supcon = SupConLoss(temperature=config['temp'])
     criterion_orth = OrthogonalLoss() # 【新增】
 
-    scaler = GradScaler()
+    scaler = GradScaler('cuda')  # 初始化 GradScaler 用于混合精度训练
 
     # --- 5. 训练循环 ---
 
@@ -147,7 +147,7 @@ def train():
 
             optimizer.zero_grad()
 
-            with autocast():
+            with autocast('cuda'):
                 # 【修改】接收 5 个返回值
                 logits, z_sem, _, f_sem_raw, v_forensic = model(imgs)
                 # C. 计算复合损失
