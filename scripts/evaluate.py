@@ -1,14 +1,9 @@
+import os
+import sys
+import yaml
 import torch
 from torch.utils.data import DataLoader
-from sklearn.metrics import accuracy_score, confusion_matrix, roc_curve, auc, precision_recall_fscore_support
-from scipy.optimize import brentq
-from scipy.interpolate import interp1d
-import matplotlib.pyplot as plt
-import numpy as np
-from tqdm import tqdm
-import os
 from torchvision import transforms
-import sys
 
 # 1. 获取当前脚本的绝对路径
 current_path = os.path.abspath(__file__)
@@ -20,122 +15,228 @@ project_root = os.path.dirname(script_dir)
 if project_root not in sys.path:
     sys.path.append(project_root)
 
-# 引入你的模型和配置
+# 导入项目模块
 from models.tsf_net import TSFNet
 from data.dataset import ForensicDataset
-from scripts.train import RandomJPEGCompression
+from utils.fft_utils import seed_everything
+from utils.metrics import BinaryMetrics
 
 
-def calculate_eer(y_true, y_score):
-    """计算 EER (Equal Error Rate)"""
-    fpr, tpr, thresholds = roc_curve(y_true, y_score, pos_label=1)
-    eer = brentq(lambda x : 1. - x - interp1d(fpr, tpr)(x), 0., 1.)
-    return eer
+def load_config():
+    """
+    优先加载项目相对路径的配置文件，若不存在则尝试绝对路径。
+    """
+    # 优先：项目 config 目录下的 model_config.yaml
+    cfg_rel_path = os.path.join(project_root, 'config', 'model_config.yaml')
+    if os.path.exists(cfg_rel_path):
+        print(f"[Info] Loading config from: {cfg_rel_path}")
+        with open(cfg_rel_path, 'r', encoding='utf-8') as f:
+            return yaml.safe_load(f)
 
-def evaluate(config):
-    device = config['device']
+    # 回退：硬编码的绝对路径 (适配你的 autodl 环境)
+    fallback = '/root/autodl-tmp/detection/config/model_config.yaml'
+    if os.path.exists(fallback):
+        print(f"[Info] Loading config from fallback path: {fallback}")
+        with open(fallback, 'r', encoding='utf-8') as f:
+            return yaml.safe_load(f)
 
-    # 1. 加载模型
-    print(f"🔄 Loading model from {config['checkpoint_path']}...")
-    model = TSFNet(config).to(device)
-    checkpoint = torch.load(config['checkpoint_path'], map_location=device, weights_only=True)
+    raise FileNotFoundError(f"Config file not found in {cfg_rel_path} or {fallback}")
 
-    # 兼容处理：有些保存可能是整包，有些是 state_dict
-    if 'model_state_dict' in checkpoint:
-        model.load_state_dict(checkpoint['model_state_dict'])
-    else:
-        model.load_state_dict(checkpoint)
 
-    model.eval()
-
-    transform = transforms.Compose([
+def build_val_loader(config, val_root: str):
+    """构建验证集 DataLoader"""
+    val_transform = transforms.Compose([
         transforms.Resize((224, 224)),
-        transforms.RandomHorizontalFlip(),
-        transforms.RandomApply([
-            transforms.GaussianBlur(kernel_size=(3, 3), sigma=(0.1, 3.0))
-        ], p=0.1),
-        transforms.RandomApply([
-            RandomJPEGCompression(quality_range=(30, 100))
-        ], p=0.1),
         transforms.ToTensor(),
         transforms.Normalize((0.4814, 0.4578, 0.4082), (0.2686, 0.2613, 0.2757))
     ])
 
-    # 2. 准备数据
-    test_dataset = ForensicDataset(
-        root_dir=config['test_data_dir'],
-        transform=transform
+    # 确保路径存在
+    if not os.path.exists(val_root):
+        print(f"[Warn] Validation directory not found: {val_root}")
+        return None
+
+    val_ds = ForensicDataset(root_dir=val_root, transform=val_transform)
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=config['batch_size'],
+        shuffle=False,
+        num_workers=4,
+        persistent_workers=True,
+        pin_memory=True,
     )
-    test_loader = DataLoader(test_dataset, batch_size=config['batch_size'], shuffle=False, num_workers=4)
+    return val_loader
 
-    # 3. 推理循环
-    y_true = []
-    y_scores = [] # 记录概率值
-    y_preds = []  # 记录 0/1 预测结果
 
-    print("🚀 Starting Evaluation...")
+def evaluate_on_val(model, val_loader, config):
+    """在验证集上运行推理并输出 BinaryMetrics 报告。"""
+    model.eval()
+    evaluator = BinaryMetrics()
+
     with torch.no_grad():
-        for imgs, labels in tqdm(test_loader):
-            imgs = imgs.to(device)
+        for imgs, labels in val_loader:
+            imgs = imgs.to(config['device'])
+            labels = labels.to(config['device']).float()
+            # 注意：这里需要根据你的模型返回值进行解包，TSFNet 返回 5 个值
+            logits, z_sem, _, _, _, _ = model(imgs)
+            evaluator.update(logits.squeeze(), labels)
 
-            # 假设你的 dataset 返回 label 0=Real, 1=Fake
-            # 但模型输出通常是 [B, 2] 或者 [B, 1]
-            # 这里假设模型输出 logits [B, 2]
+    metrics = evaluator.print_report()
+    return metrics
 
-            # 需要手动提取 clip_features 或者修改模型 forward 逻辑
-            # 这里简化演示，假设 model 内部处理好了 clip 逻辑，或者你需要像 train.py 一样先过 clip
-            # 注意：如果你的 model forward 需要 clip_emb，这里要补上 clip 提取代码
 
-            # --- 伪代码：如果 model 包含 clip 预处理 ---
-            logits, _, _, _, _ = model(imgs)
-            probs = torch.softmax(logits, dim=1)[:, 1] # 取出类别 1 (Fake) 的概率
+def evaluate_on_multiple_val_dirs(model, config, val_dirs: list[str]):
+    """
+    依次在多个验证数据集目录上评估模型。
+    """
+    results = []
+    for vdir in val_dirs:
+        val_loader = build_val_loader(config, val_root=vdir)
+        if val_loader is None:
+            continue
 
-            preds = torch.argmax(logits, dim=1)
+        print(f"\n[Info] Evaluating on val dir: {vdir}")
+        metrics = evaluate_on_val(model, val_loader, config)
+        results.append((vdir, metrics))
+    return results
 
-            y_true.extend(labels.cpu().numpy())
-            y_scores.extend(probs.cpu().numpy())
-            y_preds.extend(preds.cpu().numpy())
 
-    # 4. 计算指标
-    acc = accuracy_score(y_true, y_preds)
-    precision, recall, f1, _ = precision_recall_fscore_support(y_true, y_preds, average='binary')
-    fpr, tpr, _ = roc_curve(y_true, y_scores)
-    roc_auc = auc(fpr, tpr)
-    eer = calculate_eer(y_true, y_scores)
+def list_checkpoint_paths(checkpoints_dir: str):
+    """在目录中查找所有 model_epoch_*.pth，按 epoch 数字排序返回完整路径列表。"""
+    if not checkpoints_dir or not os.path.isdir(checkpoints_dir):
+        return []
+    ckpts = []
+    for fname in os.listdir(checkpoints_dir):
+        if fname.startswith('model_epoch_') and fname.endswith('.pth'):
+            try:
+                ep_str = fname[len('model_epoch_'):-len('.pth')]
+                ep = int(ep_str)
+            except Exception:
+                ep = -1
+            ckpts.append((ep, os.path.join(checkpoints_dir, fname)))
+    # 过滤非法 epoch，并按 epoch 升序
+    ckpts = [(ep, path) for ep, path in ckpts if ep >= 0]
+    ckpts.sort(key=lambda x: x[0])
+    return ckpts
 
-    cm = confusion_matrix(y_true, y_preds)
 
-    print("\n" + "="*30)
-    print(f"📊 Evaluation Results:")
-    print(f"Accuracy : {acc:.4f}")
-    print(f"AUC      : {roc_auc:.4f}")
-    print(f"EER      : {eer:.4f}") # 论文核心指标
-    print(f"F1-Score : {f1:.4f}")
-    print(f"Confusion Matrix:\n{cm}")
-    print("="*30)
+def evaluate_checkpoints_over_val_dirs(model, config, checkpoints_dir: str, val_dirs: list[str],
+                                       specific_epoch: int | None = None):
+    """
+    加载指定的权重（或遍历目录下的权重），在给定的验证集上进行评估。
+    """
+    results = []
 
-    # 5. 绘制并保存 ROC 曲线 (写论文用)
-    plt.figure()
-    plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (area = {roc_auc:.4f})')
-    plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
-    plt.xlim([0.0, 1.0])
-    plt.ylim([0.0, 1.05])
-    plt.xlabel('False Positive Rate')
-    plt.ylabel('True Positive Rate')
-    plt.title('Receiver Operating Characteristic')
-    plt.legend(loc="lower right")
-    plt.savefig('logs/roc_curve.png')
-    print("🖼️ ROC Curve saved to logs/roc_curve.png")
+    # 确定要测试的权重列表
+    if specific_epoch is not None:
+        ckpt_path = os.path.join(checkpoints_dir, f'model_epoch_{specific_epoch}.pth')
+        if not os.path.exists(ckpt_path):
+            print(f"[Error] Specific epoch checkpoint not found: {ckpt_path}")
+            return results
+        checkpoints = [(specific_epoch, ckpt_path)]
+    else:
+        checkpoints = list_checkpoint_paths(checkpoints_dir)
+        if not checkpoints:
+            print(f"[Error] No checkpoints found under: {checkpoints_dir}")
+            return results
 
-if __name__ == "__main__":
-    conf = {
-        'device': 'cuda',
-        'checkpoint_path': 'checkpoints/best_model.pth', # 指向你训练好的模型
-        'test_data_dir': 'data/test',
-        'batch_size': 64,
-        'input_size': 224, # 根据你的 resize
-        # ... 其他模型参数 ...
-        'clip_model': "openai/clip-vit-base-patch32",
-        'embed_dim': 256
-    }
-    evaluate(conf)
+    # 遍历每个权重文件进行评估
+    for ep, path in checkpoints:
+        print(f"\n{'=' * 20} Evaluating Epoch {ep} {'=' * 20}")
+        print(f"[Info] Loading checkpoint: {path}")
+
+        try:
+            checkpoint = torch.load(path, map_location=config['device'], weights_only=True)
+            state_dict = checkpoint.get('model_state_dict', checkpoint)
+            model.load_state_dict(state_dict)
+
+            # 在所有验证集上测试
+            ep_results = evaluate_on_multiple_val_dirs(model, config, val_dirs)
+            results.append((ep, ep_results))
+
+        except Exception as e:
+            print(f"[Error] Failed to load or evaluate checkpoint {path}: {e}")
+            continue
+
+    return results
+
+
+def average_metrics_across_val_dirs(m_list: list[tuple[str, dict]]):
+    """计算平均指标"""
+    if not m_list:
+        return {}
+    sums: dict[str, float] = {}
+    counts: dict[str, int] = {}
+    for _, metrics in m_list:
+        if not isinstance(metrics, dict):
+            continue
+        for k, v in metrics.items():
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                sums[k] = sums.get(k, 0.0) + float(v)
+                counts[k] = counts.get(k, 0) + 1
+    return {k: (sums[k] / counts[k]) for k in sums if counts.get(k, 0) > 0}
+
+
+def main():
+    # 1. 设置 HF 镜像（如果需要）
+    os.environ['HF_ENDPOINT'] = os.environ.get('HF_ENDPOINT', 'https://hf-mirror.com')
+
+    # 2. 加载配置
+    config = load_config()
+    seed_everything(config['seed'])
+
+    # 3. 初始化模型
+    print("[Info] Initializing Model...")
+    model = TSFNet(config).to(config['device'])
+
+    # 4. 从 Config 中获取推理参数
+    # 验证集列表
+    val_dirs_str = config.get('VAL_DIRS', "")
+    if not val_dirs_str:
+        print("[Error] 'VAL_DIRS' not found or empty in model_config.yaml")
+        return
+    val_dirs = [p.strip() for p in val_dirs_str.split(',') if p.strip()]
+
+    # 权重目录
+    checkpoint_dir = config.get('CHECKPOINT_DIR', "")
+    if not checkpoint_dir or not os.path.exists(checkpoint_dir):
+        print(f"[Error] 'CHECKPOINT_DIR' is invalid or not found: {checkpoint_dir}")
+        return
+
+    # 指定 Epoch (可选)
+    checkpoint_epoch = config.get('CHECKPOINT_EPOCH', None)
+    specific_epoch = int(checkpoint_epoch) if checkpoint_epoch is not None else None
+
+    print(f"[Info] Params -> Checkpoint Dir: {checkpoint_dir}")
+    print(f"[Info] Params -> Specific Epoch: {specific_epoch if specific_epoch is not None else 'All'}")
+    print(f"[Info] Params -> Val Dirs ({len(val_dirs)}):")
+    for d in val_dirs:
+        print(f"  - {d}")
+
+    # 5. 执行评估
+    results = evaluate_checkpoints_over_val_dirs(
+        model,
+        config,
+        checkpoints_dir=checkpoint_dir,
+        val_dirs=val_dirs,
+        specific_epoch=specific_epoch,
+    )
+
+    # 6. 打印最终摘要
+    print("\n\n################# Final Summary #################")
+    for ep, m_list in results:
+        print(f"\n>>> Epoch {ep}:")
+        for vdir, metrics in m_list:
+            # 提取目录名最后一部分作为简称，方便查看
+            vname = os.path.basename(vdir.rstrip('/\\'))
+            acc = metrics.get('Acc', 'N/A')
+            auc = metrics.get('AUC', 'N/A')
+            print(f"  - {vname}: Acc={acc}, AUC={auc}")
+
+        epoch_avg = average_metrics_across_val_dirs(m_list)
+        if epoch_avg:
+            print(f"  [Average]: Acc={epoch_avg.get('Acc', 0):.4f}, AUC={epoch_avg.get('AUC', 0):.4f}")
+
+
+if __name__ == '__main__':
+    main()

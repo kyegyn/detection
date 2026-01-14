@@ -151,7 +151,7 @@ def train():
 
             with autocast('cuda'):
                 # 前向传播
-                logits, z_sem, _, f_sem_raw, v_forensic = model(imgs)
+                logits, z_sem, _, f_sem_raw, v_forensic, alpha = model(imgs)
 
                 # 计算损失
                 loss_bce = criterion_bce(logits.squeeze(), labels)
@@ -162,6 +162,53 @@ def train():
                 if config.get('fusion_type') == 'gating':
                     loss_orth_val = criterion_orth(f_sem_raw, v_forensic)
                     total_loss += config.get('lambda_orth', 0.1) * loss_orth_val
+
+                # ---------------------------------------------------
+                # 【新增】计算 Gating Regularization Loss
+                # ---------------------------------------------------
+                loss_gate_val = 0.0
+                if config.get('fusion_type') == 'gating' and alpha is not None:
+                    # # 1. 计算均值和方差
+                    # # alpha 形状是 [B, 1]，先 squeeze 成 [B]
+                    # alpha_squeeze = alpha.squeeze()
+                    #
+                    # alpha_mean = alpha_squeeze.mean()
+                    # alpha_var = alpha_squeeze.var()  # 无偏估计方差
+                    #
+                    # # 2. 定义权重 (可以在 config 里配，这里先硬编码示例)
+                    # # λ_var: 鼓励方差大 (负号在公式里)
+                    # # λ_mean: 锚定均值
+                    # lambda_var = 0.01  # 这是一个经验值，不要太大，否则梯度会爆
+                    # lambda_mean = 0.001  # "极弱"锚定
+                    #
+                    # # 3. 计算损失
+                    # # 我们希望 Var 变大 -> Loss 变小 -> -Var
+                    # loss_var_term = -alpha_var
+                    # loss_mean_term = (alpha_mean - 0.5) ** 2
+                    #
+                    # loss_gate_val = lambda_var * loss_var_term + lambda_mean * loss_mean_term
+                    #
+                    # # 加入总损失
+                    # total_loss += config.get('lambda_gate', 0.01)* loss_gate_val
+
+                    # 1. 取出 alpha [B, 1] -> [B]
+                    alpha_squeeze = alpha.squeeze()
+
+                    # 2. 计算熵 (Entropy)
+                    # H(p) = - [p*log(p) + (1-p)*log(1-p)]
+                    # 加 epsilon 防止 log(0)
+                    eps = 1e-8
+                    entropy = - (alpha_squeeze * torch.log(alpha_squeeze + eps) +
+                                 (1 - alpha_squeeze) * torch.log(1 - alpha_squeeze + eps))
+
+                    # 3. 计算 Loss = - mean(Entropy)
+                    # 我们希望 Entropy 最大 -> Loss 最小
+                    loss_entropy = - entropy.mean()
+
+                    # 4. 加权
+                    # 建议权重：0.01 ~ 0.1，如果 Alpha 依然卡在 0.9，就加大到 0.1
+                    # 加入总 Loss
+                    total_loss += config.get('lambda_entropy', 0.001) * loss_entropy
 
             # 反向传播与更新
             scaler.scale(total_loss).backward()
@@ -234,7 +281,7 @@ def validate(model, val_loader, config):
             imgs = imgs.to(config['device'])
             labels = labels.to(config['device']).float()
             # 这里的 _ 占位符数量要根据你的模型返回值匹配，这里假设是 5 个
-            logits, z_sem, _, _, _ = model(imgs)
+            logits, z_sem, _, _, _, _ = model(imgs)
             evaluator.update(logits.squeeze(), labels)
     return evaluator.print_report()
 

@@ -131,11 +131,20 @@ class GatingFusion(nn.Module):
         # 1. 生成门控权重
         combined = torch.cat([z_sem, v_forensic], dim=1)
         alpha = self.gate_net(combined)  # [B, 1]
+        if not self.training:
+            # 这里的 item() 会把 tensor 转为 python float
+            avg_alpha = alpha.mean().item()
+            min_alpha = alpha.min().item()
+            max_alpha = alpha.max().item()
 
+            print(
+                f"\n[Gating Debug] Alpha Stats -> Mean: {avg_alpha:.4f} | Min: {min_alpha:.4f} | Max: {max_alpha:.4f}")
+            print(f"               (1.0 = Rely on CLIP Semantic, 0.0 = Rely on Forensic Artifacts)")
+        # -----------------------
         # 2. 动态加权融合
         f_fused = alpha * z_sem + (1 - alpha) * v_forensic
 
-        return f_fused
+        return f_fused, alpha
 
 
 # --- 【新增】辅助工具：正交损失 ---

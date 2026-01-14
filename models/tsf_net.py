@@ -85,6 +85,21 @@ class TSFNet(nn.Module):
 
         # --- Step 4: 交叉注意力融合 ---
         v_forensic, attn_weights, x_seq = self.fusion(f_loc, z_freq)
+
+        # =======================================================
+        # 【核心修改 Step 3.5】: Modality Dropout (语义丢弃)
+        # =======================================================
+        # 逻辑：在训练时，以 40% 的概率将语义特征强行置零。
+        # 目的：欺骗门控网络和分类器，让它们以为语义流失效了，
+        #       从而被迫去挖掘 v_forensic (物理流) 中的有用信息。
+        # f_sem_for_fusion = f_sem_raw
+
+        # if self.training:
+        #     # 概率建议设为 0.3 - 0.5。这里设为 0.4 (40% 概率丢弃语义)
+        #     if torch.rand(1).item() < 0.5:
+        #         f_sem_for_fusion = torch.zeros_like(f_sem_raw)
+        # =======================================================
+        alpha = None
         # 3. 最终融合决策 (Strategy Switch)
         if self.fusion_type == 'discrepancy':
             # 情况1：传入 语义向量 + 取证序列特征
@@ -92,7 +107,7 @@ class TSFNet(nn.Module):
 
         elif self.fusion_type == 'gating':
             # 情况2：传入 语义向量 + 取证聚合向量
-            final_feat = self.adv_fusion(f_sem_raw, v_forensic)
+            final_feat, alpha = self.adv_fusion(f_sem_raw, v_forensic)
 
         else:
             # 默认：简单拼接
@@ -100,4 +115,4 @@ class TSFNet(nn.Module):
         # --- Step 5: 最终分类 ---
         logits = self.classifier(final_feat)
 
-        return logits, z_sem_norm, attn_weights, f_sem_raw, v_forensic
+        return logits, z_sem_norm, attn_weights, f_sem_raw, v_forensic, alpha
