@@ -7,12 +7,24 @@ import matplotlib.pyplot as plt
 import numpy as np
 from tqdm import tqdm
 import os
+from torchvision import transforms
+import sys
+
+# 1. 获取当前脚本的绝对路径
+current_path = os.path.abspath(__file__)
+# 2. 获取当前脚本所在的目录
+script_dir = os.path.dirname(current_path)
+# 3. 获取项目的根目录
+project_root = os.path.dirname(script_dir)
+# 4. 将项目根目录添加到系统路径中
+if project_root not in sys.path:
+    sys.path.append(project_root)
 
 # 引入你的模型和配置
 from models.tsf_net import TSFNet
 from data.dataset import ForensicDataset
-# 假设你有一个 get_val_transform 用于验证集的预处理
-from data.transforms import get_val_transform
+from scripts.train import RandomJPEGCompression
+
 
 def calculate_eer(y_true, y_score):
     """计算 EER (Equal Error Rate)"""
@@ -36,10 +48,23 @@ def evaluate(config):
 
     model.eval()
 
+    transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomApply([
+            transforms.GaussianBlur(kernel_size=(3, 3), sigma=(0.1, 3.0))
+        ], p=0.1),
+        transforms.RandomApply([
+            RandomJPEGCompression(quality_range=(30, 100))
+        ], p=0.1),
+        transforms.ToTensor(),
+        transforms.Normalize((0.4814, 0.4578, 0.4082), (0.2686, 0.2613, 0.2757))
+    ])
+
     # 2. 准备数据
     test_dataset = ForensicDataset(
         root_dir=config['test_data_dir'],
-        transform=get_val_transform(config['input_size'])
+        transform=transform
     )
     test_loader = DataLoader(test_dataset, batch_size=config['batch_size'], shuffle=False, num_workers=4)
 
@@ -62,7 +87,7 @@ def evaluate(config):
             # 注意：如果你的 model forward 需要 clip_emb，这里要补上 clip 提取代码
 
             # --- 伪代码：如果 model 包含 clip 预处理 ---
-            logits, _, _ = model(imgs)
+            logits, _, _, _, _ = model(imgs)
             probs = torch.softmax(logits, dim=1)[:, 1] # 取出类别 1 (Fake) 的概率
 
             preds = torch.argmax(logits, dim=1)
