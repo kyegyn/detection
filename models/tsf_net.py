@@ -79,7 +79,7 @@ class TSFNet(nn.Module):
 
         # --- Step 2: 支路二 (局部) ---
         f_loc = self.branch2(img)
-
+        f_tex_global = f_loc.mean(dim=1)
         # --- Step 3: 支路三 (全局) ---
         z_freq = self.branch3(img)
 
@@ -115,4 +115,4 @@ class TSFNet(nn.Module):
         # --- Step 5: 最终分类 ---
         logits = self.classifier(final_feat)
 
-        return logits, z_sem_norm, attn_weights, f_sem_raw, v_forensic, alpha
+        return logits, z_sem_norm, attn_weights, f_sem_raw, v_forensic, alpha, f_tex_global, z_freq

@@ -30,7 +30,7 @@ from losses.supcon_loss import SupConLoss
 from utils.fft_utils import seed_everything
 from utils.metrics import BinaryMetrics
 from utils.logger import ExperimentLogger
-from models.fusion import OrthogonalLoss
+from models.fusion import OrthogonalLoss, FineGrainedDecorrelationLoss
 
 
 # --- 1. 定义在全局范围 ---
@@ -127,7 +127,8 @@ def train():
     # 初始化损失函数
     criterion_bce = torch.nn.BCEWithLogitsLoss()
     criterion_supcon = SupConLoss(temperature=config['temp'])
-    criterion_orth = OrthogonalLoss()
+    # criterion_orth = OrthogonalLoss()
+    criterion_decorr = FineGrainedDecorrelationLoss()
 
     scaler = GradScaler('cuda')
 
@@ -151,22 +152,26 @@ def train():
 
             with autocast('cuda'):
                 # 前向传播
-                logits, z_sem, _, f_sem_raw, v_forensic, alpha = model(imgs)
+                logits, z_sem, _, f_sem_raw, v_forensic, alpha, f_tex_global, z_freq = model(imgs)
 
                 # 计算损失
                 loss_bce = criterion_bce(logits.squeeze(), labels)
                 loss_sc = criterion_supcon(z_sem, labels)
                 total_loss = loss_bce + config['lambda_supcon'] * loss_sc
 
-                loss_orth_val = 0.0
+                # loss_orth_val = 0.0
+                loss_decorr_val = 0.0
                 if config.get('fusion_type') == 'gating':
-                    loss_orth_val = criterion_orth(f_sem_raw, v_forensic)
-                    total_loss += config.get('lambda_orth', 0.1) * loss_orth_val
+                    # loss_orth_val = criterion_orth(f_sem_raw, v_forensic)
+                    # total_loss += config.get('lambda_orth', 0.1) * loss_orth_val
+                    loss_decorr_val = criterion_decorr(f_sem_raw, f_tex_global, z_freq)
+                    total_loss += config.get('lambda_decorr', 0.01) * loss_decorr_val
 
                 # ---------------------------------------------------
                 # 【新增】计算 Gating Regularization Loss
                 # ---------------------------------------------------
                 loss_gate_val = 0.0
+                loss_entropy = 0.0
                 if config.get('fusion_type') == 'gating' and alpha is not None:
                     # # 1. 计算均值和方差
                     # # alpha 形状是 [B, 1]，先 squeeze 成 [B]
@@ -215,13 +220,21 @@ def train():
             scaler.step(optimizer)
             scaler.update()
 
+            # 为了防止变量未定义，先获取数值（安全获取）
+            val_bce = loss_bce.item()
+            val_sc  = loss_sc.item()
+            # val_orth = loss_orth_val.item() if isinstance(loss_orth_val, torch.Tensor) else 0.0
+            val_decorr = loss_decorr_val.item() if isinstance(loss_decorr_val, torch.Tensor) else 0.0
+            val_ent  = loss_entropy.item() if 'loss_entropy' in locals() and isinstance(loss_entropy, torch.Tensor) else 0.0
+
             # 记录日志
             global_step = epoch * len(train_loader) + batch_idx
             losses_dict = {
                 'total': total_loss.item(),
-                'bce': loss_bce.item(),
-                'supcon': loss_sc.item(),
-                'orth': loss_orth_val.item() if isinstance(loss_orth_val, torch.Tensor) else 0.0
+                'bce': val_bce,
+                'supcon': val_sc,
+                'decorr': val_decorr,
+                'entropy': val_ent,
             }
             logger.log_step(epoch, batch_idx, global_step, losses_dict)
 
@@ -239,8 +252,14 @@ def train():
                 torch.cuda.reset_peak_memory_stats()
                 mem_info = f"Mem: {mem_alloc:.2f}G(A) / {mem_res:.2f}G(R) / {mem_peak:.2f}G(P)"
                 # 这里加入了 LR 的打印
+                loss_detail = f"Loss: {total_loss.item():.4f} [BCE:{val_bce:.4f} SC:{val_sc:.4f}"
+                # 如果有 gating 相关的损失，也打印出来
+                if config.get('fusion_type') == 'gating':
+                    loss_detail += f" Decorr:{val_decorr:.4f} Ent:{val_ent:.4f}"
+                loss_detail += "]"
                 logger.log_file_only(
-                    f"Epoch [{epoch + 1}] Step [{batch_idx}] LR: {current_lr:.6f} | Loss: {total_loss.item():.4f} | Acc: {correct / total:.4f} | {mem_info}")
+                    f"Epoch [{epoch + 1}] Step [{batch_idx}] LR: {current_lr:.6f} | {loss_detail} | Acc: {correct / total:.4f} | {mem_info}"
+                )
 
             loop.set_description(f"Epoch [{epoch + 1}/{config['epochs']}]")
             loop.set_postfix(loss=total_loss.item(), acc=correct / total, lr=current_lr)
@@ -281,7 +300,7 @@ def validate(model, val_loader, config):
             imgs = imgs.to(config['device'])
             labels = labels.to(config['device']).float()
             # 这里的 _ 占位符数量要根据你的模型返回值匹配，这里假设是 5 个
-            logits, z_sem, _, _, _, _ = model(imgs)
+            logits, z_sem, _, _, _, _, _, _ = model(imgs)
             evaluator.update(logits.squeeze(), labels)
     return evaluator.print_report()
 

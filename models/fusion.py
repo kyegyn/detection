@@ -167,6 +167,55 @@ class OrthogonalLoss(nn.Module):
         return loss
 
 
+class SubspaceDecorrelationLoss(nn.Module):
+    def __init__(self, eps=1e-6):
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, z_a, z_b):
+        """
+        输入: z_a [Batch, Dim_A], z_b [Batch, Dim_B]
+        """
+        B = z_a.size(0)
+
+        # 1. 中心化 (Centering)
+        z_a = z_a - z_a.mean(dim=0, keepdim=True)
+        z_b = z_b - z_b.mean(dim=0, keepdim=True)
+
+        # 2. 计算协方差 (Covariance)
+        # 注意：这里除以 B-1 是无偏估计，但在深度学习 Loss 中除以 B 也没问题，只要统一即可
+        cov = (z_a.T @ z_b) / (B - 1)
+
+        # 3. 计算标准差 (Standard Deviation)
+        # 加上 eps 防止方差为 0 导致 sqrt 后除以 0
+        std_a = torch.sqrt(z_a.var(dim=0) + self.eps)
+        std_b = torch.sqrt(z_b.var(dim=0) + self.eps)
+
+        # 4. 计算相关系数矩阵 (Correlation Matrix)
+        # 利用广播机制：[Dim_A, Dim_B] / ([Dim_A, 1] * [1, Dim_B])
+        corr = cov / (std_a[:, None] * std_b[None, :])
+
+        # 5. 最小化相关系数的平方均值
+        # 即使相关系数是负的（负相关），平方后也是正的，我们希望它趋近于 0
+        return torch.mean(corr ** 2)
+
+
+class FineGrainedDecorrelationLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.decorr_loss = SubspaceDecorrelationLoss()
+
+    def forward(self, f_sem, f_tex, f_freq):
+        # 1. 语义 vs 纹理 去相关
+        loss_tex = self.decorr_loss(f_sem, f_tex)
+
+        # 2. 语义 vs 频域 去相关
+        loss_freq = self.decorr_loss(f_sem, f_freq)
+
+        # 总损失
+        return loss_tex + loss_freq
+
+
 class FinalClassifier(nn.Module):
     """
     最终分类头
