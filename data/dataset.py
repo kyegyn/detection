@@ -40,3 +40,16 @@ class ForensicDataset(Dataset):
 
         return image, label
 
+if __name__ == '__main__':
+    transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize((0.4814, 0.4578, 0.4082), (0.2686, 0.2613, 0.2757))
+    ])
+    dataset = ForensicDataset(root_dir='/root/autodl-tmp/data/val', transform=transform)
+    img_path, label = dataset.data[1]
+    print(f"Dataset size: {len(dataset)}")
+    print(f"Sample {1}: Image shape: {img_path}, Label: {label}")
+    # for i in range(5):
+    #     img, label = dataset[i]
+    #     print(f"Sample {i}: Image shape: {img.shape}, Label: {label}")

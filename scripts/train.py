@@ -160,7 +160,7 @@ def train():
         correct = 0
         total = 0
         base_entropy = config.get('lambda_entropy', 0.01)
-        current_lambda_entropy = get_current_entropy_weight(epoch, initial_val=base_entropy, warmup_epochs=3, anneal_epochs=10)
+        current_lambda_entropy = get_current_entropy_weight(epoch, initial_val=base_entropy, warmup_epochs=config.get('warmup_epochs', 3), anneal_epochs=config.get('anneal_epochs', 10))
         logger.log_file_only(f"Epoch [{epoch+1}] Annealing Status -> Lambda Entropy: {current_lambda_entropy:.6f}")
         # 获取当前学习率用于打印
         current_lr = optimizer.param_groups[0]['lr']
@@ -297,9 +297,27 @@ def train():
                 # 如果有 gating 相关的损失，也打印出来
                 if config.get('fusion_type') == 'gating':
                     loss_detail += f" Decorr:{val_decorr:.4f} Ent:{val_ent:.4f}"
+                    if alpha is not None:
+                        with torch.no_grad():
+                            alpha_t = alpha.squeeze()  # [B]
+
+                            # 0: Nature (Real), 1: AI (Fake)
+                            mask_real = (labels == 0)
+                            mask_fake = (labels == 1)
+
+                            # 计算均值 (防止 Batch 中只有一类导致除以0)
+                            mean_alpha_real = alpha_t[mask_real].mean().item() if mask_real.sum() > 0 else 0.0
+                            mean_alpha_fake = alpha_t[mask_fake].mean().item() if mask_fake.sum() > 0 else 0.0
+
+                            # 添加到日志字符串
+                            # α(R/F): Real均值 / Fake均值
+                            loss_detail += f" | α(R/F):{mean_alpha_real:.3f}/{mean_alpha_fake:.3f}"
                 loss_detail += "]"
                 logger.log_file_only(
                     f"Epoch [{epoch + 1}] Step [{batch_idx}] LR: {current_lr:.6f} | {loss_detail} | Acc: {correct / total:.4f} | {mem_info}"
+                )
+                logger.log_file_only(
+                    f"Epoch [{epoch + 1}] Step [{batch_idx}] alpha: mean={alpha.mean().item():.4f}, min={alpha.min().item():.4f}, max={alpha.max().item():.4f}"
                 )
 
             loop.set_description(f"Epoch [{epoch + 1}/{config['epochs']}]")
@@ -309,7 +327,7 @@ def train():
         scheduler.step()
 
         # --- 6. 验证环节 ---
-        metrics = validate(model, val_loader, config)
+        metrics = validate(model, val_loader, config, logger)
         logger.log_file_only(f"Epoch {epoch + 1} Val Acc: {metrics['Acc']:.4f}")
 
         # 记录 Epoch 级指标
@@ -333,16 +351,58 @@ def train():
             logger.log_file_only(f"🔥 New Best Model saved with Acc: {best_val_acc:.4f} at Epoch [{epoch + 1}]")
 
 
-def validate(model, val_loader, config):
+def validate(model, val_loader, config, logger):
     model.eval()
     evaluator = BinaryMetrics()
+
+    # 1. 初始化统计变量
+    sum_alpha_real = 0.0
+    count_real = 0
+    sum_alpha_fake = 0.0
+    count_fake = 0
+
     with torch.no_grad():
         for imgs, labels in val_loader:
             imgs = imgs.to(config['device'])
             labels = labels.to(config['device']).float()
-            # 这里的 _ 占位符数量要根据你的模型返回值匹配，这里假设是 5 个
-            logits, z_sem, _, _, _, _, _, _ = model(imgs)
+
+            # 修改解包逻辑，捕获 alpha (第6个返回值)
+            # 返回值顺序: logits, z_sem, attn, f_sem, v_fore, alpha, f_tex, z_freq
+            logits, _, _, _, _, alpha, _, _ = model(imgs)
+
             evaluator.update(logits.squeeze(), labels)
+
+            # 2. 统计当前 Batch 的 Alpha
+            if alpha is not None:
+                # 转为 CPU numpy 方便计算
+                alpha_np = alpha.squeeze().cpu().numpy()  # [B]
+                labels_np = labels.cpu().numpy()  # [B]
+
+                # 处理 batch_size=1 的边缘情况
+                if alpha_np.ndim == 0:
+                    alpha_np = np.array([alpha_np])
+
+                # 筛选真图 (Label=0)
+                mask_real = (labels_np == 0)
+                if mask_real.any():
+                    sum_alpha_real += alpha_np[mask_real].sum()
+                    count_real += mask_real.sum()
+
+                # 筛选假图 (Label=1)
+                mask_fake = (labels_np == 1)
+                if mask_fake.any():
+                    sum_alpha_fake += alpha_np[mask_fake].sum()
+                    count_fake += mask_fake.sum()
+
+    # 3. 计算并打印全局均值
+    logger.log_file_only("-" * 30)  # 分割线
+    if count_real > 0 or count_fake > 0:
+        avg_real = sum_alpha_real / count_real if count_real > 0 else 0.0
+        avg_fake = sum_alpha_fake / count_fake if count_fake > 0 else 0.0
+        logger.log_file_only(f"🧐 [Val Gating Analysis]")
+        logger.log_file_only(f"   >>> Mean Alpha (Real/Nature): {avg_real:.4f} (Should be Higher -> Trust CLIP)")
+        logger.log_file_only(f"   >>> Mean Alpha (Fake/AI)    : {avg_fake:.4f} (Should be Lower  -> Trust Physics)")
+
     return evaluator.print_report()
 
 

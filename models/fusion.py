@@ -116,7 +116,7 @@ class GatingFusion(nn.Module):
     def __init__(self, dim=256):
         super().__init__()
         self.gate_net = nn.Sequential(
-            nn.Linear(dim * 2, dim),
+            nn.Linear(dim * 4, dim),
             nn.ReLU(),
             nn.Linear(dim, 1),
             nn.Sigmoid()
@@ -128,8 +128,14 @@ class GatingFusion(nn.Module):
             z_sem: [B, D]
             v_forensic: [B, D]
         """
-        # 1. 生成门控权重
-        combined = torch.cat([z_sem, v_forensic], dim=1)
+        # 1. 计算交互特征
+        diff_feat = torch.abs(z_sem - v_forensic)  # 差异特征 (Difference)
+        prod_feat = z_sem * v_forensic  # 交互特征 (Product)
+
+        # 2. 拼接所有信息 [B, D*4]
+        combined = torch.cat([z_sem, v_forensic, diff_feat, prod_feat], dim=1)
+
+        # 3. 生成门控权重
         alpha = self.gate_net(combined)  # [B, 1]
         if not self.training:
             # 这里的 item() 会把 tensor 转为 python float
