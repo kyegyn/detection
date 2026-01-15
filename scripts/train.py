@@ -52,6 +52,25 @@ class RandomJPEGCompression(object):
         return Image.open(output_buffer)
 
 
+# --- 【新增】Gate Annealing 调度器 ---
+def get_current_entropy_weight(epoch, initial_val=0.01, warmup_epochs=10, anneal_epochs=40):
+    """
+    计算当前 Epoch 的熵正则化权重
+    策略：
+    1. Warm-up (0 ~ warmup_epochs): 保持高权重，强制物理流参与。
+    2. Annealing (warmup ~ warmup+anneal): 线性衰减至 0。
+    3. Free (warmup+anneal ~ end): 0 权重，Gate 自由决策。
+    """
+    if epoch < warmup_epochs:
+        return initial_val
+    elif epoch < (warmup_epochs + anneal_epochs):
+        # 进度: 0.0 -> 1.0
+        progress = (epoch - warmup_epochs) / float(anneal_epochs)
+        # 线性衰减: initial -> 0
+        return initial_val * (1.0 - progress)
+    else:
+        return 0.0
+
 def train():
     # --- 1. 加载配置 ---
     # 请确保路径正确
@@ -140,7 +159,9 @@ def train():
         train_loss = 0.0
         correct = 0
         total = 0
-
+        base_entropy = config.get('lambda_entropy', 0.01)
+        current_lambda_entropy = get_current_entropy_weight(epoch, initial_val=base_entropy, warmup_epochs=3, anneal_epochs=10)
+        logger.log_file_only(f"Epoch [{epoch+1}] Annealing Status -> Lambda Entropy: {current_lambda_entropy:.6f}")
         # 获取当前学习率用于打印
         current_lr = optimizer.param_groups[0]['lr']
 
@@ -157,63 +178,83 @@ def train():
                 # 计算损失
                 loss_bce = criterion_bce(logits.squeeze(), labels)
                 loss_sc = criterion_supcon(z_sem, labels)
-                total_loss = loss_bce + config['lambda_supcon'] * loss_sc
+                total_loss = loss_bce + config.get('lambda_supcon', 0) * loss_sc
 
                 # loss_orth_val = 0.0
                 loss_decorr_val = 0.0
+                loss_entropy = 0.0
                 if config.get('fusion_type') == 'gating':
                     # loss_orth_val = criterion_orth(f_sem_raw, v_forensic)
                     # total_loss += config.get('lambda_orth', 0.1) * loss_orth_val
-                    loss_decorr_val = criterion_decorr(f_sem_raw, f_tex_global, z_freq)
+                    loss_decorr_val = criterion_decorr(f_sem_raw.detach(), f_tex_global, z_freq)
                     total_loss += config.get('lambda_decorr', 0.01) * loss_decorr_val
 
+                    if alpha is not None:
+                        alpha_squeeze = alpha.squeeze()
+
+                        # 【核心修改 B】: 从 Max Entropy 改为 Margin Regularization
+                        # 逻辑：只惩罚极端值(0或1)，允许 Alpha 在 [0.5-delta, 0.5+delta] 区间内自由摆动
+                        # delta = 0.35 意味着允许区间为 [0.15, 0.85]
+                        delta = 0.25
+
+                        # 计算 Alpha 偏离 0.5 的距离
+                        dist = torch.abs(alpha_squeeze - 0.5)
+
+                        # 只有当偏离超过 delta (即进入极端区域) 时才产生 Loss
+                        # Loss = ReLU(dist - delta)
+                        margin_loss = torch.relu(dist - delta)
+
+                        loss_entropy = margin_loss.mean()
+
+                        # 使用退火权重：前期强行把 Alpha 赶回中间，后期权重归零放飞 Gate
+                        total_loss += current_lambda_entropy * loss_entropy
                 # ---------------------------------------------------
                 # 【新增】计算 Gating Regularization Loss
                 # ---------------------------------------------------
                 loss_gate_val = 0.0
-                loss_entropy = 0.0
-                if config.get('fusion_type') == 'gating' and alpha is not None:
-                    # # 1. 计算均值和方差
-                    # # alpha 形状是 [B, 1]，先 squeeze 成 [B]
-                    # alpha_squeeze = alpha.squeeze()
-                    #
-                    # alpha_mean = alpha_squeeze.mean()
-                    # alpha_var = alpha_squeeze.var()  # 无偏估计方差
-                    #
-                    # # 2. 定义权重 (可以在 config 里配，这里先硬编码示例)
-                    # # λ_var: 鼓励方差大 (负号在公式里)
-                    # # λ_mean: 锚定均值
-                    # lambda_var = 0.01  # 这是一个经验值，不要太大，否则梯度会爆
-                    # lambda_mean = 0.001  # "极弱"锚定
-                    #
-                    # # 3. 计算损失
-                    # # 我们希望 Var 变大 -> Loss 变小 -> -Var
-                    # loss_var_term = -alpha_var
-                    # loss_mean_term = (alpha_mean - 0.5) ** 2
-                    #
-                    # loss_gate_val = lambda_var * loss_var_term + lambda_mean * loss_mean_term
-                    #
-                    # # 加入总损失
-                    # total_loss += config.get('lambda_gate', 0.01)* loss_gate_val
 
-                    # 1. 取出 alpha [B, 1] -> [B]
-                    alpha_squeeze = alpha.squeeze()
-
-                    # 2. 计算熵 (Entropy)
-                    # H(p) = - [p*log(p) + (1-p)*log(1-p)]
-                    # 加 epsilon 防止 log(0)
-                    eps = 1e-8
-                    entropy = - (alpha_squeeze * torch.log(alpha_squeeze + eps) +
-                                 (1 - alpha_squeeze) * torch.log(1 - alpha_squeeze + eps))
-
-                    # 3. 计算 Loss = - mean(Entropy)
-                    # 我们希望 Entropy 最大 -> Loss 最小
-                    loss_entropy = - entropy.mean()
-
-                    # 4. 加权
-                    # 建议权重：0.01 ~ 0.1，如果 Alpha 依然卡在 0.9，就加大到 0.1
-                    # 加入总 Loss
-                    total_loss += config.get('lambda_entropy', 0.001) * loss_entropy
+                # if config.get('fusion_type') == 'gating' and alpha is not None:
+                #     # # 1. 计算均值和方差
+                #     # # alpha 形状是 [B, 1]，先 squeeze 成 [B]
+                #     # alpha_squeeze = alpha.squeeze()
+                #     #
+                #     # alpha_mean = alpha_squeeze.mean()
+                #     # alpha_var = alpha_squeeze.var()  # 无偏估计方差
+                #     #
+                #     # # 2. 定义权重 (可以在 config 里配，这里先硬编码示例)
+                #     # # λ_var: 鼓励方差大 (负号在公式里)
+                #     # # λ_mean: 锚定均值
+                #     # lambda_var = 0.01  # 这是一个经验值，不要太大，否则梯度会爆
+                #     # lambda_mean = 0.001  # "极弱"锚定
+                #     #
+                #     # # 3. 计算损失
+                #     # # 我们希望 Var 变大 -> Loss 变小 -> -Var
+                #     # loss_var_term = -alpha_var
+                #     # loss_mean_term = (alpha_mean - 0.5) ** 2
+                #     #
+                #     # loss_gate_val = lambda_var * loss_var_term + lambda_mean * loss_mean_term
+                #     #
+                #     # # 加入总损失
+                #     # total_loss += config.get('lambda_gate', 0.01)* loss_gate_val
+                #
+                #     # 1. 取出 alpha [B, 1] -> [B]
+                #     alpha_squeeze = alpha.squeeze()
+                #
+                #     # 2. 计算熵 (Entropy)
+                #     # H(p) = - [p*log(p) + (1-p)*log(1-p)]
+                #     # 加 epsilon 防止 log(0)
+                #     eps = 1e-8
+                #     entropy = - (alpha_squeeze * torch.log(alpha_squeeze + eps) +
+                #                  (1 - alpha_squeeze) * torch.log(1 - alpha_squeeze + eps))
+                #
+                #     # 3. 计算 Loss = - mean(Entropy)
+                #     # 我们希望 Entropy 最大 -> Loss 最小
+                #     loss_entropy = - entropy.mean()
+                #
+                #     # 4. 加权
+                #     # 建议权重：0.01 ~ 0.1，如果 Alpha 依然卡在 0.9，就加大到 0.1
+                #     # 加入总 Loss
+                #     total_loss += config.get('lambda_entropy', 0.001) * loss_entropy
 
             # 反向传播与更新
             scaler.scale(total_loss).backward()
