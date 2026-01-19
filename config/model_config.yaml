@@ -30,6 +30,6 @@ anneal_epochs: 10
 # 验证集目录，多个用','隔开
 VAL_DIRS: "/root/autodl-tmp/data/val,/root/autodl-tmp/adm/val,/root/autodl-tmp/biggan/val,/root/autodl-tmp/glide/val,/root/autodl-tmp/midjourney/val,/root/autodl-tmp/sdv5/val,/root/autodl-tmp/vqdm/val,/root/autodl-tmp/wukong/val"
 # 模型权重目录，默认目录下所有权重文件，
-CHECKPOINT_DIR: "/root/autodl-tmp/detection/checkpoints/exp_20260115_191220_seed3407"
+CHECKPOINT_DIR: "/root/autodl-tmp/detection/checkpoints/exp_20260116_145737_seed3407"
 # 模型权重目录下的epoch权重，只使用这一个，注释掉使用所有
-CHECKPOINT_EPOCH: 10
+CHECKPOINT_EPOCH: 20

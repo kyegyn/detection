@@ -2,110 +2,113 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision.models import resnet18, ResNet18_Weights
+import math
+
+
+class GaussianBlurLayer(nn.Module):
+    """
+    A1-1: GPU 可控、可导的高斯模糊层
+    """
+
+    def __init__(self, kernel_size=5, sigma=1.0, channels=3):
+        super(GaussianBlurLayer, self).__init__()
+        self.padding = kernel_size // 2
+
+        # 生成高斯核
+        x_coord = torch.arange(kernel_size)
+        x_grid = x_coord.repeat(kernel_size).view(kernel_size, kernel_size)
+        y_grid = x_grid.t()
+        xy_grid = torch.stack([x_grid, y_grid], dim=-1).float()
+
+        mean = (kernel_size - 1) / 2.
+        variance = sigma ** 2.
+
+        gaussian_kernel = (1. / (2. * math.pi * variance)) * \
+                          torch.exp(-torch.sum((xy_grid - mean) ** 2., dim=-1) / (2 * variance))
+        gaussian_kernel = gaussian_kernel / torch.sum(gaussian_kernel)
+
+        # 重塑为卷积权重: [channels, 1, k, k] (Depthwise Conv)
+        kernel = gaussian_kernel.view(1, 1, kernel_size, kernel_size)
+        self.register_buffer('weight', kernel.repeat(channels, 1, 1, 1))
+        self.channels = channels
+
+    def forward(self, x):
+        return F.conv2d(x, self.weight, padding=self.padding, groups=self.channels)
 
 
 class LocalPatchBranch(nn.Module):
-    """
-    支路二：局部纹理取证模块
-    功能：通过 Patch 打乱（Shuffle）破坏全局语义，利用 CNN 提取局部伪影特征。
-    """
-
-    def __init__(self, patch_size=32, embed_dim=256, pretrained=False):
+    def __init__(self, patch_size=32, embed_dim=256, pretrained=False, num_patches=32):
         super(LocalPatchBranch, self).__init__()
         self.patch_size = patch_size
+        self.num_patches = num_patches  # A1-2: 采样数量 M
 
-        # 1. 局部特征提取器 (Backbone)
-        # 使用 ResNet18 的前 4 层（直到 layer4），输出特征维度为 512
+        # A1-1: GPU Blur
+        self.blur = GaussianBlurLayer(kernel_size=5, sigma=1.0)
+
+        # Backbone
         weights = ResNet18_Weights.IMAGENET1K_V1 if pretrained else None
         base_resnet = resnet18(weights=weights)
-
-        # 去掉最后的全局平均池化 (AvgPool) 和全连接层 (FC)
         self.backbone = nn.Sequential(*list(base_resnet.children())[:-2])
 
-        # 2. 投影层：将 CNN 输出维度映射到模型统一的 embed_dim
         self.proj = nn.Sequential(
             nn.Linear(512, embed_dim),
             nn.LayerNorm(embed_dim),
             nn.GELU()
         )
 
+        # A1-3: Instance Norm 用于残差
+        self.res_norm = nn.InstanceNorm2d(3, affine=False)
+
     def extract_patches(self, x):
-        """
-        利用 unfold 高效切分 Patch
-        输入 x: [B, 3, 224, 224]
-        输出 patches: [B, N, 3, P, P], 其中 N 是 Patch 数量, P 是 patch_size
-        """
         b, c, h, w = x.shape
         p = self.patch_size
-
-        # 在高度和宽度维度上进行滑动窗口切分
-        # [B, 3, 224, 224] -> [B, 3, 7, 7, 32, 32] (假设 224/32=7)
         patches = x.unfold(2, p, p).unfold(3, p, p)
-
-        # 调整维度顺序: [B, 7, 7, 3, 32, 32]
         patches = patches.permute(0, 2, 3, 1, 4, 5).contiguous()
-
-        # 展平 Patch 数量维: [B, 49, 3, 32, 32]
         patches = patches.view(b, -1, c, p, p)
         return patches
 
-    def shuffle_patches(self, patches):
-        """
-        在图像内部打乱 Patch 的顺序
-        patches: [B, N, 3, P, P]
-        """
-        b, n, c, ph, pw = patches.shape
-        # 为每一张图生成独立的随机索引
-        # 如果追求性能，也可以在 Batch 级别统一使用一个索引，但独立索引安全性更高
-        device = patches.device
-        # per-sample random permutations: [B, N]
-        idx = torch.stack([torch.randperm(n, device=device) for _ in range(b)], dim=0)
-        # reshape 成适合 gather 的索引: [B, N, C, P, P]
-        idx = idx.unsqueeze(2).unsqueeze(3).unsqueeze(4).expand(-1, -1, c, ph, pw)
-        shuffled = patches.gather(1, idx)
-        return shuffled
+    def sample_patches(self, patches):
+        """A1-2: 随机采样 M 个 Patch"""
+        b, n, c, h, w = patches.shape
+        if n <= self.num_patches:
+            return patches
+
+        if self.training:
+            # 训练时随机采样
+            indices = torch.stack([torch.randperm(n, device=patches.device)[:self.num_patches] for _ in range(b)])
+            # [B, M, C, H, W]
+            sampled = torch.stack([patches[i][indices[i]] for i in range(b)])
+            return sampled
+        else:
+            # 推理时固定采样中心或间隔采样，保证确定性
+            # 这里简单取前 M 个
+            return patches[:, :self.num_patches]
 
     def forward(self, x):
-        """
-        前向传播逻辑
-        """
-        b, _, _, _ = x.shape
+        # A1-1 & A1-3
+        with torch.no_grad():
+            x_blur = self.blur(x)
+            x_res = x - x_blur
+            x_res = self.res_norm(x_res)  # 强制高频规范化
 
-        # 1. 切分 Patch: [B, 49, 3, 32, 32]
-        patches = self.extract_patches(x)
+        # Extract & Sample
+        patches = self.extract_patches(x_res)
+        patches = self.sample_patches(patches)  # A1-2
 
-        # 2. Shuffle (只在训练模式下强制 Shuffle，或者为了防止模型依赖位置，推理也 Shuffle)
-        patches = self.shuffle_patches(patches)
+        # Encode
+        b, n, c, h, w = patches.shape
 
-        # 3. 准备喂入 CNN
-        # 为了提高效率，将 Batch 和 Patch 维度合并: [B*49, 3, 32, 32]
-        n = patches.size(1)
-        patches_flattened = patches.view(-1, 3, self.patch_size, self.patch_size)
+        # 【修复点】使用 reshape 替代 view，自动处理非连续内存
+        patches_flat = patches.reshape(-1, c, h, w)
 
-        # 4. 特征提取
-        # ResNet18 的 layer4 输出通常是 [B*49, 512, 1, 1] (对于 32x32 的输入)
-        feat = self.backbone(patches_flattened)
-
-        # 如果输入不是 32 的整数倍导致输出不是 1x1，进行全局平均池化
+        feat = self.backbone(patches_flat)
         if feat.size(-1) > 1:
             feat = F.adaptive_avg_pool2d(feat, (1, 1))
 
-        feat = feat.view(feat.size(0), -1)  # [B*49, 512]
+        feat = feat.view(feat.size(0), -1)
+        out = self.proj(feat)  # [B, M, D]
 
-        # 5. 投影与恢复维度
-        feat_proj = self.proj(feat)  # [B*49, embed_dim]
-
-        # 还原回序列格式: [B, 49, embed_dim]
-        out = feat_proj.view(b, n, -1)
+        # 恢复 Batch 维度
+        out = out.view(b, n, -1)
 
         return out
-
-
-# --- 单元测试 ---
-if __name__ == "__main__":
-    dummy_img = torch.randn(2, 3, 224, 224)
-    model = LocalPatchBranch(patch_size=32, embed_dim=256)
-    output = model(dummy_img)
-
-    print(f"输入图像形状: {dummy_img.shape}")
-    print(f"输出特征序列形状: {output.shape}")  # 应为 [2, 49, 256]

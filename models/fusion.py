@@ -5,59 +5,94 @@ import torch.nn.functional as F
 
 class CrossAttentionFusion(nn.Module):
     """
-    交叉注意力融合模块
-    核心逻辑：使用全局频率特征 (Global Context) 作为 Key/Value，
-             去“扫描”和增强局部 Patch 特征 (Query)。
+    支路三 (A3)：Token-level Fusion + Evidence Pooling
+    改进点 (方案A)：
+    1. Token-to-Token Cross Attention (Loc <-> Freq)
+    2. Attention Pooling 替代 Mean Pooling
     """
 
     def __init__(self, embed_dim=256, num_heads=8, dropout=0.1):
         super().__init__()
 
-        # Cross-Attention 层
-        # batch_first=True 意味着输入形状为 [Batch, Seq_Len, Dim]
-        self.attn = nn.MultiheadAttention(embed_dim, num_heads, dropout=dropout, batch_first=True)
-
-        # 标准 Transformer Block 的组件：Norm 和 Feed-Forward
+        # Cross-Attention: Loc Queries Freq
+        self.attn_loc_freq = nn.MultiheadAttention(embed_dim, num_heads, dropout=dropout, batch_first=True)
         self.norm1 = nn.LayerNorm(embed_dim)
+        # A3-2: 增加 MLP
+        self.mlp1 = nn.Sequential(nn.Linear(embed_dim, 4 * embed_dim), nn.GELU(), nn.Dropout(dropout),
+                                  nn.Linear(4 * embed_dim, embed_dim))
+
+        # Cross-Attention: Freq Queries Loc
+        self.attn_freq_loc = nn.MultiheadAttention(embed_dim, num_heads, dropout=dropout, batch_first=True)
         self.norm2 = nn.LayerNorm(embed_dim)
+        # A3-2: 给 Freq 也加 MLP
+        self.mlp2 = nn.Sequential(nn.Linear(embed_dim, 4 * embed_dim), nn.GELU(), nn.Dropout(dropout),
+                                  nn.Linear(4 * embed_dim, embed_dim))
 
-        self.mlp = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim * 4),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(embed_dim * 4, embed_dim)
-        )
+        # Evidence Pooling
+        self.pool_loc = AttentionPooling(embed_dim)
+        self.pool_freq = AttentionPooling(embed_dim)
 
-    def forward(self, f_loc, z_freq):
+        # Final Projection
+        # Concatenate (Loc + Freq) -> D
+        self.final_proj = nn.Linear(embed_dim * 2, embed_dim)
+
+    def forward(self, f_loc, f_freq):
         """
         Args:
-            f_loc: 局部 Patch 特征序列 [B, N, D] (Query)
-            z_freq: 全局频率特征向量 [B, D] (Key/Value)
+            f_loc: 局部 Token 序列 [B, N, D]
+            f_freq: 频带 Token 序列 [B, K, D]
         Returns:
-            v_forensic: 聚合后的取证特征 [B, D]
-            attn_weights: 注意力权重矩阵 [B, N, 1] (用于可视化)
+            v_forensic: [B, D] 最终取证向量
+            attn_weights: [B, N, K] 可视化用
+            x_seq: [B, N, D] 增强后的局部序列 (用于 DiscrepancyFusion)
         """
-        # 1. 维度调整：将全局向量扩展为序列格式，作为 Context
-        # z_freq: [B, D] -> [B, 1, D]
-        kv = z_freq.unsqueeze(1)
 
-        # 2. Cross-Attention 计算
-        # Query=f_loc (局部), Key=kv (全局), Value=kv (全局)
-        # attn_output: [B, N, D]
-        # attn_weights: [B, N, 1] (表示每个 Patch 与全局频率的相关性)
-        attn_output, attn_weights = self.attn(query=f_loc, key=kv, value=kv)
+        # 1. Loc Queries Freq
+        loc_enhanced, attn_weights = self.attn_loc_freq(query=f_loc, key=f_freq, value=f_freq)
+        x_loc = self.norm1(f_loc + loc_enhanced)
+        x_loc = x_loc + self.mlp1(x_loc)
 
-        # 3. 残差连接 + Norm (Add & Norm)
-        x = self.norm1(f_loc + attn_output)
+        # 2. Freq Queries Loc (A3-1: Key/Value 使用更新后的 x_loc)
+        freq_enhanced, _ = self.attn_freq_loc(query=f_freq, key=x_loc, value=x_loc)
+        x_freq = self.norm2(f_freq + freq_enhanced)
+        x_freq = x_freq + self.mlp2(x_freq)  # A3-2: 对称增强
 
-        # 4. 前馈网络 + 残差 + Norm
-        x = self.norm2(x + self.mlp(x))
+        # 3. Evidence Pooling
+        v_loc_pooled = self.pool_loc(x_loc)  # [B, D]
+        v_freq_pooled = self.pool_freq(x_freq)  # [B, D]
 
-        # 5. 全局平均池化 (GAP)
-        # 将增强后的 N 个 Patch 特征聚合成一个向量
-        v_forensic = x.mean(dim=1)
+        # 4. 融合
+        v_cat = torch.cat([v_loc_pooled, v_freq_pooled], dim=1)  # [B, 2D]
+        v_forensic = self.final_proj(v_cat)  # [B, D]
 
-        return v_forensic, attn_weights, x
+        return v_forensic, attn_weights, x_loc
+
+
+class AttentionPooling(nn.Module):
+    """
+    A3-3: Evidence-aware Attention Pooling
+    学习每个 Token 的重要性权重，加权求和。
+    """
+
+    def __init__(self, embed_dim):
+        super().__init__()
+        self.attn = nn.Sequential(
+            nn.Linear(embed_dim, 1),
+            nn.Tanh()  # 限制范围，增加非线性
+        )
+
+    def forward(self, x):
+        """
+        x: [B, Seq_Len, D]
+        return: [B, D]
+        """
+        # 计算 scores: [B, N, 1]
+        scores = self.attn(x)
+        # Softmax over sequence dimension
+        weights = F.softmax(scores, dim=1)
+        # Weighted sum
+        out = torch.sum(x * weights, dim=1)
+        return out
 
 
 # --- 【新增】情况1：差异感知融合 ---
@@ -128,12 +163,17 @@ class GatingFusion(nn.Module):
             z_sem: [B, D]
             v_forensic: [B, D]
         """
+        # G-1: Gate 输入前统一尺度归一化
+        # 这不会影响最后输出特征的模长(feature fusion)，只影响 Gate 的判断
+        z_sem_n = F.normalize(z_sem, p=2, dim=1)
+        v_forensic_n = F.normalize(v_forensic, p=2, dim=1)
+
         # 1. 计算交互特征
-        diff_feat = torch.abs(z_sem - v_forensic)  # 差异特征 (Difference)
-        prod_feat = z_sem * v_forensic  # 交互特征 (Product)
+        diff_feat = torch.abs(z_sem_n - v_forensic_n)  # 差异特征 (Difference)
+        prod_feat = z_sem_n * v_forensic_n  # 交互特征 (Product)
 
         # 2. 拼接所有信息 [B, D*4]
-        combined = torch.cat([z_sem, v_forensic, diff_feat, prod_feat], dim=1)
+        combined = torch.cat([z_sem_n, v_forensic_n, diff_feat, prod_feat], dim=1)
 
         # 3. 生成门控权重
         alpha = self.gate_net(combined)  # [B, 1]
@@ -147,7 +187,7 @@ class GatingFusion(nn.Module):
                 f"\n[Gating Debug] Alpha Stats -> Mean: {avg_alpha:.4f} | Min: {min_alpha:.4f} | Max: {max_alpha:.4f}")
             print(f"               (1.0 = Rely on CLIP Semantic, 0.0 = Rely on Forensic Artifacts)")
         # -----------------------
-        # 2. 动态加权融合
+        # 2. 动态加权融合 (融合使用原始特征)
         f_fused = alpha * z_sem + (1 - alpha) * v_forensic
 
         return f_fused, alpha
@@ -182,6 +222,12 @@ class SubspaceDecorrelationLoss(nn.Module):
         """
         输入: z_a [Batch, Dim_A], z_b [Batch, Dim_B]
         """
+        # 维度检查与自适应处理
+        if z_a.dim() > 2:
+            z_a = z_a.mean(dim=1)  # [B, K, D] -> [B, D]
+        if z_b.dim() > 2:
+            z_b = z_b.mean(dim=1)  # [B, K, D] -> [B, D]
+
         B = z_a.size(0)
 
         # 1. 中心化 (Centering)
@@ -216,6 +262,7 @@ class FineGrainedDecorrelationLoss(nn.Module):
         loss_tex = self.decorr_loss(f_sem, f_tex)
 
         # 2. 语义 vs 频域 去相关
+        # 注意：f_freq 可能是 [B, K, D]，decorr_loss 内部会自动 mean(1) 变成 [B, D]
         loss_freq = self.decorr_loss(f_sem, f_freq)
 
         # 总损失

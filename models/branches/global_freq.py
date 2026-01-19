@@ -1,69 +1,85 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+import math
 
 
 class GlobalFreqBranch(nn.Module):
     """
-    支路三：全局频率指纹提取模块
-    功能：利用 FFT 捕捉图像在生成过程中由于上采样导致的频谱异常。
+    支路三 (A2)：多频带频率 Token 分支
+    改进点 (方案A)：
+    1. 引入 Instance Normalization 消除亮度/对比度影响。
+    2. 将频谱按径向切分为 K 个频带 Token，显式建模不同频段的异常。
     """
 
-    def __init__(self, embed_dim=256):
+    def __init__(self, embed_dim=256, num_bands=8, img_size=224):
         super(GlobalFreqBranch, self).__init__()
+        self.num_bands = num_bands
+        self.register_buffer('band_masks', self._create_radial_masks(img_size, num_bands))
 
-        # 定义一个轻量级 CNN，用于从频谱图中提取特征
-        self.freq_net = nn.Sequential(
-            nn.Conv2d(1, 32, kernel_size=3, stride=2, padding=1),  # 224 -> 112
-            nn.BatchNorm2d(32),
+        # A2-1: 输入维度是 3 (Mean, Std, Max)
+        input_stats_dim = 3
+
+        self.band_proj = nn.Sequential(
+            nn.Linear(input_stats_dim, embed_dim),
+            nn.LayerNorm(embed_dim),
             nn.ReLU(),
-
-            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),  # 112 -> 56
-            nn.BatchNorm2d(64),
-            nn.ReLU(),
-
-            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),  # 56 -> 28
-            nn.BatchNorm2d(128),
-            nn.ReLU(),
-
-            nn.AdaptiveAvgPool2d((1, 1)),  # 压缩为 [B, 128, 1, 1]
-            nn.Flatten()
+            nn.Linear(embed_dim, embed_dim)
         )
 
-        self.proj = nn.Linear(128, embed_dim)
+    def _create_radial_masks(self, size, k):
+        center = size // 2
+        y, x = torch.meshgrid(torch.arange(size), torch.arange(size), indexing='ij')
+        r = torch.sqrt((x - center) ** 2 + (y - center) ** 2)
+        max_r = size / math.sqrt(2)
+        masks = []
+        step = max_r / k
+        for i in range(k):
+            r_min = step * i
+            r_max = step * (i + 1)
+            mask = (r >= r_min) & (r < r_max)
+            masks.append(mask.float())
+        return torch.stack(masks)
 
     def forward(self, x):
-        """
-        输入 x: [B, 3, 224, 224]
-        """
-        # 1. 转为灰度图 (频谱分析通常在单通道进行)
-        x_gray = torch.mean(x, dim=1, keepdim=True)  # [B, 1, 224, 224]
+        B = x.shape[0]
+        # 1. 预处理
+        x_gray = torch.mean(x, dim=1, keepdim=True)
+        fft = torch.fft.fft2(x_gray)
+        fft_shift = torch.fft.fftshift(fft)
+        mag_log = torch.log(1 + torch.abs(fft_shift))
 
-        # 2. 执行快速傅里叶变换 (FFT)
-        # fft2 得到复数张量
-        fft_complex = torch.fft.fft2(x_gray)
+        # 2. 归一化 (Instance Normalization)
+        mean = mag_log.mean(dim=[2, 3], keepdim=True)
+        std = mag_log.std(dim=[2, 3], keepdim=True) + 1e-6
+        mag_norm = (mag_log - mean) / std
+        mag_norm = mag_norm.squeeze(1)  # [B, H, W]
 
-        # 3. 将低频成分移到频谱中心 (Shift)
-        fft_shift = torch.fft.fftshift(fft_complex)
+        # 3. 准备广播
+        mag_expand = mag_norm.unsqueeze(1)  # [B, 1, H, W]
+        masks_expand = self.band_masks.unsqueeze(0)  # [1, K, H, W]
 
-        # 4. 计算幅度谱 (Magnitude Spectrum)
-        # abs 得到复数的模
-        mag = torch.abs(fft_shift)
+        # 4. 屏蔽无效区域 (Masking)
+        masked_val = mag_expand * masks_expand  # [B, K, H, W]
 
-        # 5. 对数变换 (Log Transform)
-        # 关键步骤：频谱值跨度极大，对数化能让高频弱信号（AI 伪影）更明显
-        mag_log = torch.log(1 + mag)
+        # --- 统计量计算 ---
 
-        # 6. CNN 提取特征
-        feat = self.freq_net(mag_log)  # [B, 128]
-        z_freq = self.proj(feat)  # [B, embed_dim]
+        # A. Mean
+        mask_sums = masks_expand.sum(dim=[2, 3]) + 1e-6
+        means = masked_val.sum(dim=[2, 3]) / mask_sums  # [B, K]
 
-        return z_freq
+        # B. Max (关键修复)
+        # 使用 masked_fill 替代布尔索引赋值，解决形状不匹配问题
+        # 将掩码为 0 (False) 的区域填充为 -1e9，以免影响 Max 计算
+        masked_val_for_max = masked_val.masked_fill(masks_expand == 0, -1e9)
+        maxs = masked_val_for_max.amax(dim=[2, 3])  # [B, K]
 
+        # C. Std
+        means_expand = means.unsqueeze(-1).unsqueeze(-1)  # [B, K, 1, 1]
+        var_part = ((mag_expand - means_expand) ** 2) * masks_expand
+        stds = torch.sqrt(var_part.sum(dim=[2, 3]) / mask_sums + 1e-6)  # [B, K]
 
-# --- 单元测试 ---
-if __name__ == "__main__":
-    dummy_input = torch.randn(2, 3, 224, 224)
-    model = GlobalFreqBranch(embed_dim=256)
-    out = model(dummy_input)
-    print(f"全局频率特征形状: {out.shape}")  # [2, 256]
+        # 5. 拼接与投影
+        band_feats = torch.stack([means, stds, maxs], dim=-1)  # [B, K, 3]
+        z_freq_seq = self.band_proj(band_feats)  # [B, K, D]
+
+        return z_freq_seq
