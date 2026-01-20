@@ -145,7 +145,7 @@ def train():
 
     # 初始化损失函数
     criterion_bce = torch.nn.BCEWithLogitsLoss()
-    criterion_supcon = SupConLoss(temperature=config['temp'])
+    # criterion_supcon = SupConLoss(temperature=config['temp'])
     # criterion_orth = OrthogonalLoss()
     criterion_decorr = FineGrainedDecorrelationLoss()
 
@@ -177,8 +177,9 @@ def train():
 
                 # 计算损失
                 loss_bce = criterion_bce(logits.squeeze(), labels)
-                loss_sc = criterion_supcon(z_sem, labels)
-                total_loss = loss_bce + config.get('lambda_supcon', 0) * loss_sc
+                # loss_sc = criterion_supcon(z_sem, labels)
+                # total_loss = loss_bce + config.get('lambda_supcon', 0) * loss_sc
+                total_loss = loss_bce
 
                 # loss_orth_val = 0.0
                 loss_decorr_val = 0.0
@@ -263,7 +264,8 @@ def train():
 
             # 为了防止变量未定义，先获取数值（安全获取）
             val_bce = loss_bce.item()
-            val_sc  = loss_sc.item()
+            # val_sc  = loss_sc.item()
+            val_sc  = 0
             # val_orth = loss_orth_val.item() if isinstance(loss_orth_val, torch.Tensor) else 0.0
             val_decorr = loss_decorr_val.item() if isinstance(loss_decorr_val, torch.Tensor) else 0.0
             val_ent  = loss_entropy.item() if 'loss_entropy' in locals() and isinstance(loss_entropy, torch.Tensor) else 0.0
@@ -273,7 +275,7 @@ def train():
             losses_dict = {
                 'total': total_loss.item(),
                 'bce': val_bce,
-                'supcon': val_sc,
+                # 'supcon': val_sc,
                 'decorr': val_decorr,
                 'entropy': val_ent,
             }
