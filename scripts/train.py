@@ -100,9 +100,9 @@ def train():
     val_ds = ForensicDataset(root_dir='/root/autodl-tmp/data/val', transform=train_transform)
 
     train_loader = DataLoader(train_ds, batch_size=config['batch_size'], shuffle=True, num_workers=4,
-                              persistent_workers=True, pin_memory=True, worker_init_fn=worker_init_fn)
+                              persistent_workers=True, pin_memory=True, worker_init_fn=worker_init_fn, drop_last=True)
     val_loader = DataLoader(val_ds, batch_size=config['batch_size'], shuffle=False, num_workers=4,
-                            persistent_workers=True, pin_memory=True, worker_init_fn=worker_init_fn)
+                            persistent_workers=True, pin_memory=True, worker_init_fn=worker_init_fn, drop_last=True)
 
     # --- 3. 模型初始化 ---
     model = TSFNet(config).to(config['device'])

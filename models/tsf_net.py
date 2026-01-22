@@ -5,7 +5,7 @@ import torch.nn as nn
 from .branches.semantic import SemanticBranch
 from .branches.local_patch import LocalPatchBranch
 from .branches.global_freq import GlobalFreqBranch
-from .fusion import CrossAttentionFusion, FinalClassifier, DiscrepancyFusion, GatingFusion
+from .fusion import CrossAttentionFusion, FinalClassifier, DiscrepancyFusion, GatingFusion, AgentAttentionFusion
 
 
 class TSFNet(nn.Module):
@@ -35,10 +35,16 @@ class TSFNet(nn.Module):
             embed_dim=config['embed_dim']
         )
 
-        # --- 2. 实例化融合模块 ---
-        self.fusion = CrossAttentionFusion(
+        # # --- 2. 实例化融合模块 ---
+        # self.fusion = CrossAttentionFusion(
+        #     embed_dim=config['embed_dim'],
+        #     num_heads=8
+        # )
+        print("🚀 Using Sparse Agent Attention Fusion (Top-K Denoising)")
+        self.fusion = AgentAttentionFusion(
             embed_dim=config['embed_dim'],
-            num_heads=8
+            num_heads=8,
+            dropout=0.1
         )
         # --- 3. 高级融合策略选择 (Switch) ---
         # 默认为 'concat' (老方法), 可选 'discrepancy' (情况1), 'gating' (情况2)

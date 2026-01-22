@@ -68,6 +68,136 @@ class CrossAttentionFusion(nn.Module):
         return v_forensic, attn_weights, x_loc
 
 
+class AgentAttention(nn.Module):
+    """
+    Agent Attention 模块 (支持可控 Top-K 稀疏化)
+    """
+    def __init__(self, dim, num_heads=8, agent_num=8, dropout=0.1, topk_ratio=0.5, active_topk=True):
+        """
+        Args:
+            topk_ratio: 保留比例
+            active_topk: 是否启用 Top-K (用于区分正反向)
+        """
+        super().__init__()
+        self.num_heads = num_heads
+        self.scale = (dim // num_heads) ** -0.5
+        self.agent_num = agent_num
+        self.topk_ratio = topk_ratio
+        self.active_topk = active_topk  # ✅ 新增控制开关
+
+        # 1. Agent 生成器
+        self.agent_proj = nn.Linear(dim, dim)
+
+        # 2. Agent 交互 (Agent -> Key)
+        self.q_agent = nn.Linear(dim, dim)
+        self.k_context = nn.Linear(dim, dim)
+        self.v_context = nn.Linear(dim, dim)
+
+        # 3. 广播 (Query -> Agent)
+        self.q_orig = nn.Linear(dim, dim)
+        self.k_agent = nn.Linear(dim, dim)
+        self.v_agent = nn.Linear(dim, dim)
+
+        self.proj = nn.Linear(dim, dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, query, key, value):
+        B, N, D = query.shape
+        S = key.shape[1]
+        H = self.num_heads
+
+        # --- Step 1: 生成 Agent ---
+        agent_tokens = F.adaptive_avg_pool1d(query.transpose(1, 2), self.agent_num).transpose(1, 2)
+        agent_tokens = self.agent_proj(agent_tokens)
+
+        # --- Step 2: Agent 读取 Context (Key) ---
+        q_a = self.q_agent(agent_tokens).reshape(B, self.agent_num, H, D//H).permute(0, 2, 1, 3)
+        k_c = self.k_context(key).reshape(B, S, H, D//H).permute(0, 2, 1, 3)
+        v_c = self.v_context(value).reshape(B, S, H, D//H).permute(0, 2, 1, 3)
+
+        # [B, H, Agent, S] -> 这里 S 代表 Key 的长度 (频带数 或 Patch数)
+        attn_agent = (q_a @ k_c.transpose(-2, -1)) * self.scale
+
+        # ✅ 【修改点 1】 仅在开关开启时执行 Top-K
+        if self.active_topk:
+            k_to_keep = max(1, int(S * self.topk_ratio))
+            if k_to_keep < S:
+                topk_vals, _ = attn_agent.topk(k_to_keep, dim=-1)
+                mask = attn_agent < topk_vals[..., -1, None]
+                attn_agent = attn_agent.masked_fill(mask, float('-inf'))
+
+        attn_agent_weights = F.softmax(attn_agent, dim=-1) # 保存这个用于返回
+        agent_out = (attn_agent_weights @ v_c)
+
+        agent_out = agent_out.transpose(1, 2).reshape(B, self.agent_num, D)
+
+        # --- Step 3: Query 读取 Agent ---
+        q_o = self.q_orig(query).reshape(B, N, H, D//H).permute(0, 2, 1, 3)
+        k_a = self.k_agent(agent_out).reshape(B, self.agent_num, H, D//H).permute(0, 2, 1, 3)
+        v_a = self.v_agent(agent_out).reshape(B, self.agent_num, H, D//H).permute(0, 2, 1, 3)
+
+        attn_final = (q_o @ k_a.transpose(-2, -1)) * self.scale
+        attn_final = F.softmax(attn_final, dim=-1)
+
+        out = (attn_final @ v_a).transpose(1, 2).reshape(B, N, D)
+        out = self.proj(out)
+        out = self.dropout(out)
+
+        # ✅ 【修改点 2】 返回 attn_agent_weights (Agent看Key的权重)
+        return out, attn_final, attn_agent_weights
+
+
+class AgentAttentionFusion(nn.Module):
+    def __init__(self, embed_dim=256, num_heads=8, dropout=0.1):
+        super().__init__()
+
+        agent_num = 8
+        topk_ratio = 0.5
+
+        # 1. Loc -> Freq (正向): 开启 Top-K (S=8, 筛选频带)
+        self.attn_loc_freq = AgentAttention(
+            embed_dim, num_heads, agent_num, dropout, topk_ratio,
+            active_topk=True  # ✅ 开启
+        )
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.mlp1 = nn.Sequential(nn.Linear(embed_dim, 4*embed_dim), nn.GELU(), nn.Dropout(dropout), nn.Linear(4*embed_dim, embed_dim))
+
+        # 2. Freq -> Loc (反向): 关闭 Top-K (S=49, 保持对所有 Patch 的全感知)
+        self.attn_freq_loc = AgentAttention(
+            embed_dim, num_heads, agent_num, dropout, topk_ratio,
+            active_topk=False # ✅ 关闭 (Dense Attention)
+        )
+        self.norm2 = nn.LayerNorm(embed_dim)
+        self.mlp2 = nn.Sequential(nn.Linear(embed_dim, 4*embed_dim), nn.GELU(), nn.Dropout(dropout), nn.Linear(4*embed_dim, embed_dim))
+
+        self.pool_loc = AttentionPooling(embed_dim)
+        self.pool_freq = AttentionPooling(embed_dim)
+        self.final_proj = nn.Linear(embed_dim * 2, embed_dim)
+
+    def forward(self, f_loc, f_freq):
+        # 1. 正向: Loc 找 异常频带 (Top-K 生效)
+        # band_attn: [B, H, Agent, Num_Bands] -> 这就是你要可视化的 "哪些频带被选中"
+        loc_enhanced, _, band_attn = self.attn_loc_freq(query=f_loc, key=f_freq, value=f_freq)
+        x_loc = self.norm1(f_loc + loc_enhanced)
+        x_loc = x_loc + self.mlp1(x_loc)
+
+        # 2. 反向: Freq 找 空间位置 (Dense)
+        # 这里返回的第二个 attn 是 agent 看 patch 的权重，如果想看空间热力图可以用这个
+        freq_enhanced, _, spatial_attn = self.attn_freq_loc(query=f_freq, key=x_loc, value=x_loc)
+        x_freq = self.norm2(f_freq + freq_enhanced)
+        x_freq = x_freq + self.mlp2(x_freq)
+
+        v_loc_pooled = self.pool_loc(x_loc)
+        v_freq_pooled = self.pool_freq(x_freq)
+
+        v_cat = torch.cat([v_loc_pooled, v_freq_pooled], dim=1)
+        v_forensic = self.final_proj(v_cat)
+
+        # ✅ 【修改点 3】 返回 band_attn 用于后续分析
+        # 为了兼容性，也可以把它存到 attn_weights 里返回
+        return v_forensic, band_attn, x_loc
+
+
 class AttentionPooling(nn.Module):
     """
     A3-3: Evidence-aware Attention Pooling
@@ -229,7 +359,9 @@ class SubspaceDecorrelationLoss(nn.Module):
             z_b = z_b.mean(dim=1)  # [B, K, D] -> [B, D]
 
         B = z_a.size(0)
-
+        if B < 2:
+            # 如果 Batch Size 小于 2，无法计算协方差，直接返回 0 Loss
+            return torch.tensor(0.0, device=z_a.device, requires_grad=True)
         # 1. 中心化 (Centering)
         z_a = z_a - z_a.mean(dim=0, keepdim=True)
         z_b = z_b - z_b.mean(dim=0, keepdim=True)
