@@ -52,25 +52,6 @@ class RandomJPEGCompression(object):
         return Image.open(output_buffer)
 
 
-# --- 【新增】Gate Annealing 调度器 ---
-def get_current_entropy_weight(epoch, initial_val=0.01, warmup_epochs=10, anneal_epochs=40):
-    """
-    计算当前 Epoch 的熵正则化权重
-    策略：
-    1. Warm-up (0 ~ warmup_epochs): 保持高权重，强制物理流参与。
-    2. Annealing (warmup ~ warmup+anneal): 线性衰减至 0。
-    3. Free (warmup+anneal ~ end): 0 权重，Gate 自由决策。
-    """
-    if epoch < warmup_epochs:
-        return initial_val
-    elif epoch < (warmup_epochs + anneal_epochs):
-        # 进度: 0.0 -> 1.0
-        progress = (epoch - warmup_epochs) / float(anneal_epochs)
-        # 线性衰减: initial -> 0
-        return initial_val * (1.0 - progress)
-    else:
-        return 0.0
-
 def train():
     # --- 1. 加载配置 ---
     # 请确保路径正确
@@ -160,8 +141,6 @@ def train():
         correct = 0
         total = 0
         base_entropy = config.get('lambda_entropy', 0.01)
-        current_lambda_entropy = get_current_entropy_weight(epoch, initial_val=base_entropy, warmup_epochs=config.get('warmup_epochs', 3), anneal_epochs=config.get('anneal_epochs', 10))
-        logger.log_file_only(f"Epoch [{epoch+1}] Annealing Status -> Lambda Entropy: {current_lambda_entropy:.6f}")
         # 获取当前学习率用于打印
         current_lr = optimizer.param_groups[0]['lr']
 
@@ -173,7 +152,7 @@ def train():
 
             with autocast('cuda'):
                 # 前向传播
-                logits, z_sem, _, f_sem_raw, v_forensic, alpha, f_tex_global, z_freq = model(imgs)
+                logits, z_sem, _, f_sem_raw, v_forensic, alpha, beta, f_tex_global, z_freq = model(imgs)
 
                 # 计算损失
                 loss_bce = criterion_bce(logits.squeeze(), labels)
@@ -183,79 +162,22 @@ def train():
 
                 # loss_orth_val = 0.0
                 loss_decorr_val = 0.0
-                loss_entropy = 0.0
+                loss_reg = 0.0
                 if config.get('fusion_type') == 'gating':
                     # loss_orth_val = criterion_orth(f_sem_raw, v_forensic)
                     # total_loss += config.get('lambda_orth', 0.1) * loss_orth_val
                     loss_decorr_val = criterion_decorr(f_sem_raw.detach(), f_tex_global, z_freq)
                     total_loss += config.get('lambda_decorr', 0.01) * loss_decorr_val
-
-                    if alpha is not None:
-                        alpha_squeeze = alpha.squeeze()
-
-                        # 【核心修改 B】: 从 Max Entropy 改为 Margin Regularization
-                        # 逻辑：只惩罚极端值(0或1)，允许 Alpha 在 [0.5-delta, 0.5+delta] 区间内自由摆动
-                        # delta = 0.35 意味着允许区间为 [0.15, 0.85]
-                        delta = 0.25
-
-                        # 计算 Alpha 偏离 0.5 的距离
-                        dist = torch.abs(alpha_squeeze - 0.5)
-
-                        # 只有当偏离超过 delta (即进入极端区域) 时才产生 Loss
-                        # Loss = ReLU(dist - delta)
-                        margin_loss = torch.relu(dist - delta)
-
-                        loss_entropy = margin_loss.mean()
-
-                        # 使用退火权重：前期强行把 Alpha 赶回中间，后期权重归零放飞 Gate
-                        total_loss += current_lambda_entropy * loss_entropy
+                    if alpha is not None and beta is not None:
+                        # 稀疏正则化：鼓励权重中有 0 (抑制无效特征)
+                        # 权重系数建议给小一点，例如 1e-4
+                        reg_loss = (torch.mean(torch.abs(alpha)) + torch.mean(torch.abs(beta))) * config.get('lambda_l1', 0.0001)
+                        total_loss += reg_loss
                 # ---------------------------------------------------
                 # 【新增】计算 Gating Regularization Loss
                 # ---------------------------------------------------
                 loss_gate_val = 0.0
 
-                # if config.get('fusion_type') == 'gating' and alpha is not None:
-                #     # # 1. 计算均值和方差
-                #     # # alpha 形状是 [B, 1]，先 squeeze 成 [B]
-                #     # alpha_squeeze = alpha.squeeze()
-                #     #
-                #     # alpha_mean = alpha_squeeze.mean()
-                #     # alpha_var = alpha_squeeze.var()  # 无偏估计方差
-                #     #
-                #     # # 2. 定义权重 (可以在 config 里配，这里先硬编码示例)
-                #     # # λ_var: 鼓励方差大 (负号在公式里)
-                #     # # λ_mean: 锚定均值
-                #     # lambda_var = 0.01  # 这是一个经验值，不要太大，否则梯度会爆
-                #     # lambda_mean = 0.001  # "极弱"锚定
-                #     #
-                #     # # 3. 计算损失
-                #     # # 我们希望 Var 变大 -> Loss 变小 -> -Var
-                #     # loss_var_term = -alpha_var
-                #     # loss_mean_term = (alpha_mean - 0.5) ** 2
-                #     #
-                #     # loss_gate_val = lambda_var * loss_var_term + lambda_mean * loss_mean_term
-                #     #
-                #     # # 加入总损失
-                #     # total_loss += config.get('lambda_gate', 0.01)* loss_gate_val
-                #
-                #     # 1. 取出 alpha [B, 1] -> [B]
-                #     alpha_squeeze = alpha.squeeze()
-                #
-                #     # 2. 计算熵 (Entropy)
-                #     # H(p) = - [p*log(p) + (1-p)*log(1-p)]
-                #     # 加 epsilon 防止 log(0)
-                #     eps = 1e-8
-                #     entropy = - (alpha_squeeze * torch.log(alpha_squeeze + eps) +
-                #                  (1 - alpha_squeeze) * torch.log(1 - alpha_squeeze + eps))
-                #
-                #     # 3. 计算 Loss = - mean(Entropy)
-                #     # 我们希望 Entropy 最大 -> Loss 最小
-                #     loss_entropy = - entropy.mean()
-                #
-                #     # 4. 加权
-                #     # 建议权重：0.01 ~ 0.1，如果 Alpha 依然卡在 0.9，就加大到 0.1
-                #     # 加入总 Loss
-                #     total_loss += config.get('lambda_entropy', 0.001) * loss_entropy
 
             # 反向传播与更新
             scaler.scale(total_loss).backward()
@@ -268,7 +190,7 @@ def train():
             val_sc  = 0
             # val_orth = loss_orth_val.item() if isinstance(loss_orth_val, torch.Tensor) else 0.0
             val_decorr = loss_decorr_val.item() if isinstance(loss_decorr_val, torch.Tensor) else 0.0
-            val_ent  = loss_entropy.item() if 'loss_entropy' in locals() and isinstance(loss_entropy, torch.Tensor) else 0.0
+            val_reg = loss_reg.item() if 'loss_entropy' in locals() and isinstance(loss_reg, torch.Tensor) else 0.0
 
             # 记录日志
             global_step = epoch * len(train_loader) + batch_idx
@@ -277,7 +199,7 @@ def train():
                 'bce': val_bce,
                 # 'supcon': val_sc,
                 'decorr': val_decorr,
-                'entropy': val_ent,
+                'reg': val_reg,
             }
             logger.log_step(epoch, batch_idx, global_step, losses_dict)
 
@@ -298,7 +220,7 @@ def train():
                 loss_detail = f"Loss: {total_loss.item():.4f} [BCE:{val_bce:.4f} SC:{val_sc:.4f}"
                 # 如果有 gating 相关的损失，也打印出来
                 if config.get('fusion_type') == 'gating':
-                    loss_detail += f" Decorr:{val_decorr:.4f} Ent:{val_ent:.4f}"
+                    loss_detail += f" Decorr:{val_decorr:.4f} Reg:{val_reg:.4f}"
                     if alpha is not None:
                         with torch.no_grad():
                             alpha_t = alpha.squeeze()  # [B]
@@ -357,12 +279,6 @@ def validate(model, val_loader, config, logger):
     model.eval()
     evaluator = BinaryMetrics()
 
-    # 1. 初始化统计变量
-    sum_alpha_real = 0.0
-    count_real = 0
-    sum_alpha_fake = 0.0
-    count_fake = 0
-
     with torch.no_grad():
         for imgs, labels in val_loader:
             imgs = imgs.to(config['device'])
@@ -370,40 +286,9 @@ def validate(model, val_loader, config, logger):
 
             # 修改解包逻辑，捕获 alpha (第6个返回值)
             # 返回值顺序: logits, z_sem, attn, f_sem, v_fore, alpha, f_tex, z_freq
-            logits, _, _, _, _, alpha, _, _ = model(imgs)
+            logits, _, _, _, _, alpha, beta, _, _ = model(imgs)
 
             evaluator.update(logits.squeeze(), labels)
-
-            # 2. 统计当前 Batch 的 Alpha
-            if alpha is not None:
-                # 转为 CPU numpy 方便计算
-                alpha_np = alpha.squeeze().cpu().numpy()  # [B]
-                labels_np = labels.cpu().numpy()  # [B]
-
-                # 处理 batch_size=1 的边缘情况
-                if alpha_np.ndim == 0:
-                    alpha_np = np.array([alpha_np])
-
-                # 筛选真图 (Label=0)
-                mask_real = (labels_np == 0)
-                if mask_real.any():
-                    sum_alpha_real += alpha_np[mask_real].sum()
-                    count_real += mask_real.sum()
-
-                # 筛选假图 (Label=1)
-                mask_fake = (labels_np == 1)
-                if mask_fake.any():
-                    sum_alpha_fake += alpha_np[mask_fake].sum()
-                    count_fake += mask_fake.sum()
-
-    # 3. 计算并打印全局均值
-    logger.log_file_only("-" * 30)  # 分割线
-    if count_real > 0 or count_fake > 0:
-        avg_real = sum_alpha_real / count_real if count_real > 0 else 0.0
-        avg_fake = sum_alpha_fake / count_fake if count_fake > 0 else 0.0
-        logger.log_file_only(f"🧐 [Val Gating Analysis]")
-        logger.log_file_only(f"   >>> Mean Alpha (Real/Nature): {avg_real:.4f} (Should be Higher -> Trust CLIP)")
-        logger.log_file_only(f"   >>> Mean Alpha (Fake/AI)    : {avg_fake:.4f} (Should be Lower  -> Trust Physics)")
 
     return evaluator.print_report()
 

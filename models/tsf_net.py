@@ -5,7 +5,7 @@ import torch.nn as nn
 from .branches.semantic import SemanticBranch
 from .branches.local_patch import LocalPatchBranch
 from .branches.global_freq import GlobalFreqBranch
-from .fusion import CrossAttentionFusion, FinalClassifier, DiscrepancyFusion, GatingFusion, AgentAttentionFusion
+from .fusion import CrossAttentionFusion, FinalClassifier, DiscrepancyFusion, GatingFusion, AgentAttentionFusion, ChannelWiseIndependentGatingFusion
 
 
 class TSFNet(nn.Module):
@@ -56,8 +56,10 @@ class TSFNet(nn.Module):
             cls_input_dim = embed_dim # 融合后维度保持为 D
 
         elif self.fusion_type == 'gating':
-            print("🚀 Using Strategy 2: Dynamic Gating Fusion")
-            self.adv_fusion = GatingFusion(dim=embed_dim)
+            # print("🚀 Using Strategy 2: Dynamic Gating Fusion")
+            # self.adv_fusion = GatingFusion(dim=embed_dim)
+            print("🚀 Using Strategy: Channel-wise Independent Gating Fusion")
+            self.adv_fusion = ChannelWiseIndependentGatingFusion(dim=embed_dim)
             cls_input_dim = embed_dim # 融合后维度保持为 D
 
         else:
@@ -106,6 +108,7 @@ class TSFNet(nn.Module):
         #         f_sem_for_fusion = torch.zeros_like(f_sem_raw)
         # =======================================================
         alpha = None
+        beta = None
         # 3. 最终融合决策 (Strategy Switch)
         if self.fusion_type == 'discrepancy':
             # 情况1：传入 语义向量 + 取证序列特征
@@ -113,7 +116,8 @@ class TSFNet(nn.Module):
 
         elif self.fusion_type == 'gating':
             # 情况2：传入 语义向量 + 取证聚合向量
-            final_feat, alpha = self.adv_fusion(f_sem_raw, v_forensic)
+            # final_feat, alpha = self.adv_fusion(f_sem_raw, v_forensic)
+            final_feat, alpha, beta = self.adv_fusion(f_sem_raw, v_forensic)
 
         else:
             # 默认：简单拼接
@@ -121,4 +125,4 @@ class TSFNet(nn.Module):
         # --- Step 5: 最终分类 ---
         logits = self.classifier(final_feat)
 
-        return logits, z_sem_norm, attn_weights, f_sem_raw, v_forensic, alpha, f_tex_global, z_freq
+        return logits, z_sem_norm, attn_weights, f_sem_raw, v_forensic, alpha, beta, f_tex_global, z_freq

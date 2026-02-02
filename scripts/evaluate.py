@@ -78,7 +78,7 @@ def evaluate_on_val(model, val_loader, config):
             imgs = imgs.to(config['device'])
             labels = labels.to(config['device']).float()
             # 注意：这里需要根据你的模型返回值进行解包，TSFNet 返回 5 个值
-            logits, z_sem, _, _, _, _, _, _ = model(imgs)
+            logits, z_sem, _, _, _, _, _, _, _ = model(imgs)
             evaluator.update(logits.squeeze(), labels)
 
     metrics = evaluator.print_report()

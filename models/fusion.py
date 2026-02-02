@@ -422,3 +422,72 @@ class FinalClassifier(nn.Module):
 
     def forward(self, x):
         return self.net(x)
+
+class ChannelWiseIndependentGatingFusion(nn.Module):
+    """
+    通道级独立双流门控机制 (Channel-wise Independent Dual-Stream Gating)
+
+    核心特性：
+    1. Channel-wise: 输出权重是向量 [B, D]，实现特征维度的细粒度控制。
+    2. Independent: 分别生成 alpha (语义权) 和 beta (物理权)，解除互斥约束，
+       允许两者同时高（特征增强）或同时低（背景去噪）。
+    """
+    def __init__(self, dim=256):
+        super().__init__()
+
+        # 1. 共享特征提取器 (捕捉交互信息)
+        self.shared_net = nn.Sequential(
+            nn.Linear(dim * 4, dim),
+            nn.LayerNorm(dim), # 归一化稳定分布
+            nn.ReLU()
+        )
+
+        # 2. 独立门控头 A：生成语义流权重向量 alpha
+        self.head_sem = nn.Sequential(
+            nn.Linear(dim, dim), # 输出维度 D (通道级)
+            nn.Sigmoid()         # 范围 [0, 1]
+        )
+
+        # 3. 独立门控头 B：生成物理流权重向量 beta
+        self.head_phy = nn.Sequential(
+            nn.Linear(dim, dim), # 输出维度 D (通道级)
+            nn.Sigmoid()         # 范围 [0, 1]
+        )
+
+        # 4. 后处理归一化 (防止 alpha+beta > 1 导致特征幅值爆炸)
+        self.post_norm = nn.LayerNorm(dim)
+
+    def forward(self, z_sem, v_forensic):
+        """
+        Args:
+            z_sem: 语义特征 [B, D]
+            v_forensic: 物理取证特征 [B, D]
+        """
+        # --- 1. 归一化与交互特征计算 ---
+        z_sem_n = F.normalize(z_sem, p=2, dim=1)
+        v_forensic_n = F.normalize(v_forensic, p=2, dim=1)
+
+        diff_feat = torch.abs(z_sem_n - v_forensic_n) # 差异特征
+        prod_feat = z_sem_n * v_forensic_n            # 共现特征
+
+        # 拼接所有信息 [B, D*4]
+        combined = torch.cat([z_sem_n, v_forensic_n, diff_feat, prod_feat], dim=1)
+
+        # --- 2. 提取共享门控特征 ---
+        gate_feat = self.shared_net(combined)
+
+        # --- 3. 生成两个独立的通道级权重向量 [B, D] ---
+        alpha_vec = self.head_sem(gate_feat) # 语义权重
+        beta_vec  = self.head_phy(gate_feat) # 物理权重
+
+        # --- 4. 独立加权融合 ---
+        # 允许 alpha + beta != 1，实现特征增强或抑制
+        f_fused = alpha_vec * z_sem + beta_vec * v_forensic
+
+        # --- 5. 必须做 Post-Normalization ---
+        # 因为不再是凸组合，幅值可能变化较大
+        f_fused = self.post_norm(f_fused)
+
+        # --- 6. 返回结果 ---
+        # 返回 alpha_vec 和 beta_vec 的均值，用于日志监控和正则化 Loss
+        return f_fused, alpha_vec.mean(dim=1, keepdim=True), beta_vec.mean(dim=1, keepdim=True)

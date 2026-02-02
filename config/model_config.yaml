@@ -20,12 +20,9 @@ use_lora: True    # 是否使用 LoRA 微调，False 则为解冻少部分参数
 fusion_type: 'gating'
 # 正交损失权重 (仅在 gating 模式下生效)
 lambda_orth: 0.001
-lambda_entropy: 0.01
 lambda_gate: 0.01
 lambda_decorr: 0.001
-
-warmup_epochs: 3
-anneal_epochs: 10
+lambda_l1: 0.0001
 # 推理：
 # 验证集目录，多个用','隔开
 VAL_DIRS: "/root/autodl-tmp/data/val,/root/autodl-tmp/adm/val,/root/autodl-tmp/biggan/val,/root/autodl-tmp/glide/val,/root/autodl-tmp/midjourney/val,/root/autodl-tmp/sdv5/val,/root/autodl-tmp/vqdm/val,/root/autodl-tmp/wukong/val"

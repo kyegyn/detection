@@ -75,7 +75,7 @@ def evaluate_on_val(model, val_loader, config):
 
             # 解包：捕获中间特征和 Alpha
             # TSFNet return: logits, z_sem, attn, f_sem_raw, v_forensic, alpha, f_tex, z_freq
-            logits, _, _, f_sem_raw, v_forensic, alpha, _, _ = model(imgs)
+            logits, _, _, f_sem_raw, v_forensic, alpha, beta, _, _ = model(imgs)
 
             evaluator.update(logits.squeeze(), labels)
 
