@@ -344,7 +344,7 @@ class OrthogonalLoss(nn.Module):
 
 
 class SubspaceDecorrelationLoss(nn.Module):
-    def __init__(self, eps=1e-6):
+    def __init__(self, eps=1e-5):
         super().__init__()
         self.eps = eps
 
@@ -352,6 +352,8 @@ class SubspaceDecorrelationLoss(nn.Module):
         """
         输入: z_a [Batch, Dim_A], z_b [Batch, Dim_B]
         """
+        z_a = z_a.float()
+        z_b = z_b.float()
         # 维度检查与自适应处理
         if z_a.dim() > 2:
             z_a = z_a.mean(dim=1)  # [B, K, D] -> [B, D]
@@ -375,9 +377,11 @@ class SubspaceDecorrelationLoss(nn.Module):
         std_a = torch.sqrt(z_a.var(dim=0) + self.eps)
         std_b = torch.sqrt(z_b.var(dim=0) + self.eps)
 
-        # 4. 计算相关系数矩阵 (Correlation Matrix)
-        # 利用广播机制：[Dim_A, Dim_B] / ([Dim_A, 1] * [1, Dim_B])
-        corr = cov / (std_a[:, None] * std_b[None, :])
+        denominator = std_a[:, None] * std_b[None, :]
+        # 再次兜底：防止 denominator 恰好为 0
+        denominator = torch.clamp(denominator, min=self.eps)
+
+        corr = cov / denominator
 
         # 5. 最小化相关系数的平方均值
         # 即使相关系数是负的（负相关），平方后也是正的，我们希望它趋近于 0
