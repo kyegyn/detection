@@ -285,7 +285,7 @@ def validate(model, val_loader, config, logger):
             labels = labels.to(config['device']).float()
 
             # 修改解包逻辑，捕获 alpha (第6个返回值)
-            # 返回值顺序: logits, z_sem, attn, f_sem, v_fore, alpha, f_tex, z_freq
+            # 返回值顺序: logits, z_sem, attn, f_sem, v_fore, alpha, beta, f_tex, z_freq
             logits, _, _, _, _, alpha, beta, _, _ = model(imgs)
 
             evaluator.update(logits.squeeze(), labels)

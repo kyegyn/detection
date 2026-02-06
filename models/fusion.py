@@ -72,6 +72,7 @@ class AgentAttention(nn.Module):
     """
     Agent Attention 模块 (支持可控 Top-K 稀疏化)
     """
+
     def __init__(self, dim, num_heads=8, agent_num=8, dropout=0.1, topk_ratio=0.5, active_topk=True):
         """
         Args:
@@ -111,9 +112,9 @@ class AgentAttention(nn.Module):
         agent_tokens = self.agent_proj(agent_tokens)
 
         # --- Step 2: Agent 读取 Context (Key) ---
-        q_a = self.q_agent(agent_tokens).reshape(B, self.agent_num, H, D//H).permute(0, 2, 1, 3)
-        k_c = self.k_context(key).reshape(B, S, H, D//H).permute(0, 2, 1, 3)
-        v_c = self.v_context(value).reshape(B, S, H, D//H).permute(0, 2, 1, 3)
+        q_a = self.q_agent(agent_tokens).reshape(B, self.agent_num, H, D // H).permute(0, 2, 1, 3)
+        k_c = self.k_context(key).reshape(B, S, H, D // H).permute(0, 2, 1, 3)
+        v_c = self.v_context(value).reshape(B, S, H, D // H).permute(0, 2, 1, 3)
 
         # [B, H, Agent, S] -> 这里 S 代表 Key 的长度 (频带数 或 Patch数)
         attn_agent = (q_a @ k_c.transpose(-2, -1)) * self.scale
@@ -126,15 +127,15 @@ class AgentAttention(nn.Module):
                 mask = attn_agent < topk_vals[..., -1, None]
                 attn_agent = attn_agent.masked_fill(mask, float('-inf'))
 
-        attn_agent_weights = F.softmax(attn_agent, dim=-1) # 保存这个用于返回
+        attn_agent_weights = F.softmax(attn_agent, dim=-1)  # 保存这个用于返回
         agent_out = (attn_agent_weights @ v_c)
 
         agent_out = agent_out.transpose(1, 2).reshape(B, self.agent_num, D)
 
         # --- Step 3: Query 读取 Agent ---
-        q_o = self.q_orig(query).reshape(B, N, H, D//H).permute(0, 2, 1, 3)
-        k_a = self.k_agent(agent_out).reshape(B, self.agent_num, H, D//H).permute(0, 2, 1, 3)
-        v_a = self.v_agent(agent_out).reshape(B, self.agent_num, H, D//H).permute(0, 2, 1, 3)
+        q_o = self.q_orig(query).reshape(B, N, H, D // H).permute(0, 2, 1, 3)
+        k_a = self.k_agent(agent_out).reshape(B, self.agent_num, H, D // H).permute(0, 2, 1, 3)
+        v_a = self.v_agent(agent_out).reshape(B, self.agent_num, H, D // H).permute(0, 2, 1, 3)
 
         attn_final = (q_o @ k_a.transpose(-2, -1)) * self.scale
         attn_final = F.softmax(attn_final, dim=-1)
@@ -160,15 +161,17 @@ class AgentAttentionFusion(nn.Module):
             active_topk=True  # ✅ 开启
         )
         self.norm1 = nn.LayerNorm(embed_dim)
-        self.mlp1 = nn.Sequential(nn.Linear(embed_dim, 4*embed_dim), nn.GELU(), nn.Dropout(dropout), nn.Linear(4*embed_dim, embed_dim))
+        self.mlp1 = nn.Sequential(nn.Linear(embed_dim, 4 * embed_dim), nn.GELU(), nn.Dropout(dropout),
+                                  nn.Linear(4 * embed_dim, embed_dim))
 
         # 2. Freq -> Loc (反向): 关闭 Top-K (S=49, 保持对所有 Patch 的全感知)
         self.attn_freq_loc = AgentAttention(
             embed_dim, num_heads, agent_num, dropout, topk_ratio,
-            active_topk=False # ✅ 关闭 (Dense Attention)
+            active_topk=False  # ✅ 关闭 (Dense Attention)
         )
         self.norm2 = nn.LayerNorm(embed_dim)
-        self.mlp2 = nn.Sequential(nn.Linear(embed_dim, 4*embed_dim), nn.GELU(), nn.Dropout(dropout), nn.Linear(4*embed_dim, embed_dim))
+        self.mlp2 = nn.Sequential(nn.Linear(embed_dim, 4 * embed_dim), nn.GELU(), nn.Dropout(dropout),
+                                  nn.Linear(4 * embed_dim, embed_dim))
 
         self.pool_loc = AttentionPooling(embed_dim)
         self.pool_freq = AttentionPooling(embed_dim)
@@ -344,48 +347,56 @@ class OrthogonalLoss(nn.Module):
 
 
 class SubspaceDecorrelationLoss(nn.Module):
-    def __init__(self, eps=1e-5):
+    def __init__(self, eps=1e-5, threshold=0.2):
+        """
+        Args:
+            eps: 数值稳定项
+            threshold: 允许的最大相关性阈值 (0.0 - 1.0)。
+                       设为 0.1 表示允许 10% 的线性相关冗余。
+        """
         super().__init__()
         self.eps = eps
+        self.threshold = threshold
 
     def forward(self, z_a, z_b):
-        """
-        输入: z_a [Batch, Dim_A], z_b [Batch, Dim_B]
-        """
+        # --- 1. 基础数值保护 (必须保留，防止崩溃) ---
         z_a = z_a.float()
         z_b = z_b.float()
-        # 维度检查与自适应处理
-        if z_a.dim() > 2:
-            z_a = z_a.mean(dim=1)  # [B, K, D] -> [B, D]
-        if z_b.dim() > 2:
-            z_b = z_b.mean(dim=1)  # [B, K, D] -> [B, D]
+
+        # 维度适配
+        if z_a.dim() > 2: z_a = z_a.mean(dim=1)
+        if z_b.dim() > 2: z_b = z_b.mean(dim=1)
 
         B = z_a.size(0)
-        if B < 2:
-            # 如果 Batch Size 小于 2，无法计算协方差，直接返回 0 Loss
-            return torch.tensor(0.0, device=z_a.device, requires_grad=True)
-        # 1. 中心化 (Centering)
-        z_a = z_a - z_a.mean(dim=0, keepdim=True)
-        z_b = z_b - z_b.mean(dim=0, keepdim=True)
+        if B < 2: return torch.tensor(0.0, device=z_a.device)
 
-        # 2. 计算协方差 (Covariance)
-        # 注意：这里除以 B-1 是无偏估计，但在深度学习 Loss 中除以 B 也没问题，只要统一即可
-        cov = (z_a.T @ z_b) / (B - 1)
+        # --- 2. 计算相关系数矩阵 ---
+        z_a_centered = z_a - z_a.mean(dim=0, keepdim=True)
+        z_b_centered = z_b - z_b.mean(dim=0, keepdim=True)
 
-        # 3. 计算标准差 (Standard Deviation)
-        # 加上 eps 防止方差为 0 导致 sqrt 后除以 0
-        std_a = torch.sqrt(z_a.var(dim=0) + self.eps)
-        std_b = torch.sqrt(z_b.var(dim=0) + self.eps)
+        cov = (z_a_centered.T @ z_b_centered) / (B - 1)
 
+        # 加强版的分母保护 (防止 NaN 的关键)
+        std_a = torch.sqrt(torch.clamp(z_a.var(dim=0), min=1e-6))
+        std_b = torch.sqrt(torch.clamp(z_b.var(dim=0), min=1e-6))
         denominator = std_a[:, None] * std_b[None, :]
-        # 再次兜底：防止 denominator 恰好为 0
-        denominator = torch.clamp(denominator, min=self.eps)
+        denominator = torch.clamp(denominator, min=1e-4)
 
         corr = cov / denominator
 
-        # 5. 最小化相关系数的平方均值
-        # 即使相关系数是负的（负相关），平方后也是正的，我们希望它趋近于 0
-        return torch.mean(corr ** 2)
+        # --- 3. 【核心修改】引入阈值松弛 ---
+        # 原逻辑: loss = mean(corr^2) -> 强制趋向于 0
+        # 新逻辑: 只有当 |corr| > threshold 时才惩罚
+
+        abs_corr = torch.abs(corr)
+
+        # 使用 ReLU 实现 Hinge 逻辑: max(0, |corr| - threshold)
+        diff = torch.relu(abs_corr - self.threshold)
+
+        # 仍然使用平方惩罚，但只针对超出的部分
+        loss = torch.mean(diff ** 2)
+
+        return loss
 
 
 class FineGrainedDecorrelationLoss(nn.Module):
@@ -427,6 +438,7 @@ class FinalClassifier(nn.Module):
     def forward(self, x):
         return self.net(x)
 
+
 class ChannelWiseIndependentGatingFusion(nn.Module):
     """
     通道级独立双流门控机制 (Channel-wise Independent Dual-Stream Gating)
@@ -436,26 +448,27 @@ class ChannelWiseIndependentGatingFusion(nn.Module):
     2. Independent: 分别生成 alpha (语义权) 和 beta (物理权)，解除互斥约束，
        允许两者同时高（特征增强）或同时低（背景去噪）。
     """
+
     def __init__(self, dim=256):
         super().__init__()
 
         # 1. 共享特征提取器 (捕捉交互信息)
         self.shared_net = nn.Sequential(
             nn.Linear(dim * 4, dim),
-            nn.LayerNorm(dim), # 归一化稳定分布
+            nn.LayerNorm(dim),  # 归一化稳定分布
             nn.ReLU()
         )
 
         # 2. 独立门控头 A：生成语义流权重向量 alpha
         self.head_sem = nn.Sequential(
-            nn.Linear(dim, dim), # 输出维度 D (通道级)
-            nn.Sigmoid()         # 范围 [0, 1]
+            nn.Linear(dim, dim),  # 输出维度 D (通道级)
+            nn.Sigmoid()  # 范围 [0, 1]
         )
 
         # 3. 独立门控头 B：生成物理流权重向量 beta
         self.head_phy = nn.Sequential(
-            nn.Linear(dim, dim), # 输出维度 D (通道级)
-            nn.Sigmoid()         # 范围 [0, 1]
+            nn.Linear(dim, dim),  # 输出维度 D (通道级)
+            nn.Sigmoid()  # 范围 [0, 1]
         )
 
         # 4. 后处理归一化 (防止 alpha+beta > 1 导致特征幅值爆炸)
@@ -471,8 +484,8 @@ class ChannelWiseIndependentGatingFusion(nn.Module):
         z_sem_n = F.normalize(z_sem, p=2, dim=1)
         v_forensic_n = F.normalize(v_forensic, p=2, dim=1)
 
-        diff_feat = torch.abs(z_sem_n - v_forensic_n) # 差异特征
-        prod_feat = z_sem_n * v_forensic_n            # 共现特征
+        diff_feat = torch.abs(z_sem_n - v_forensic_n)  # 差异特征
+        prod_feat = z_sem_n * v_forensic_n  # 共现特征
 
         # 拼接所有信息 [B, D*4]
         combined = torch.cat([z_sem_n, v_forensic_n, diff_feat, prod_feat], dim=1)
@@ -481,8 +494,8 @@ class ChannelWiseIndependentGatingFusion(nn.Module):
         gate_feat = self.shared_net(combined)
 
         # --- 3. 生成两个独立的通道级权重向量 [B, D] ---
-        alpha_vec = self.head_sem(gate_feat) # 语义权重
-        beta_vec  = self.head_phy(gate_feat) # 物理权重
+        alpha_vec = self.head_sem(gate_feat)  # 语义权重
+        beta_vec = self.head_phy(gate_feat)  # 物理权重
 
         # --- 4. 独立加权融合 ---
         # 允许 alpha + beta != 1，实现特征增强或抑制
