@@ -3,6 +3,134 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class SparseSpatialFrequencyAttention(nn.Module):
+    """
+    Sparse Spatial-Frequency Attention (SSFA)
+    稀疏空频注意力模块
+
+    功能：
+    作为物理层的互证机制，让空间域的局部纹理特征 (Query)
+    稀疏地关注最可疑的频率域频带特征 (Key/Value)。
+
+    流程：
+    1. 频带证据打分 (Evidence Scoring)
+    2. Top-K 稀疏路由 (Sparse Routing)
+    3. 频带门控 (Band Gating)
+    4. 空间-频率交叉注意力 (Spatial-Frequency Cross Attention)
+    """
+    def __init__(self, dim, num_heads=8, num_bands=8, topk=3, qkv_bias=False, attn_drop=0., proj_drop=0.):
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        # 确保 topk 不超过总频带数 (例如 8)
+        self.topk = min(topk, num_bands)
+        self.scale = (dim // num_heads) ** -0.5
+
+        # --- Step A: 频带证据打分头 ---
+        # 输入 [B, K, D] -> 输出 [B, K, 1]
+        self.scorer = nn.Sequential(
+            nn.Linear(dim, dim // 4),
+            nn.ReLU(),
+            nn.Linear(dim // 4, 1)
+        )
+
+        # --- Step D: Cross Attention 组件 ---
+        self.q_proj = nn.Linear(dim, dim, bias=qkv_bias)
+        self.k_proj = nn.Linear(dim, dim, bias=qkv_bias)
+        self.v_proj = nn.Linear(dim, dim, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+        # Normalization
+        self.norm_loc = nn.LayerNorm(dim)  # for spatial texture
+        self.norm_freq = nn.LayerNorm(dim) # for frequency band
+
+        # FFN (Feed Forward Network)
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, dim * 4),
+            nn.GELU(),
+            nn.Dropout(proj_drop),
+            nn.Linear(dim * 4, dim),
+            nn.Dropout(proj_drop)
+        )
+        self.norm_ffn = nn.LayerNorm(dim)
+
+    def forward(self, f_loc, f_freq):
+        """
+        Args:
+            f_loc:  [B, N, D] (Spatial Texture Tokens / Query)
+            f_freq: [B, K, D] (Frequency Band Tokens / Key & Value)
+        Returns:
+            f_loc_enhanced: [B, N, D] 增强后的局部特征
+            v_phy:          [B, D]    聚合后的物理取证向量
+            routing_weights:[B, K]    路由权重(用于可视化)
+        """
+        B, N, D = f_loc.shape
+        K = f_freq.shape[1]
+
+        # ================= Step A & B: 证据打分与稀疏路由 =================
+        # 1. 打分: [B, K, D] -> [B, K]
+        # 评估每个频带包含伪造痕迹的置信度
+        scores = self.scorer(f_freq).squeeze(-1)
+
+        # 2. Top-k Masking (数值稳定性保护)
+        # 找出前 k 个最高分
+        topk_values, _ = torch.topk(scores, self.topk, dim=1)
+        # 获取阈值 (第 k 大的分数)
+        threshold = topk_values[:, -1].unsqueeze(1) # [B, 1]
+
+        # 生成 Mask: 低于阈值的设为极小值 (-inf)
+        mask = scores < threshold
+        scores_masked = scores.masked_fill(mask, -1e4)
+
+        # 3. 生成稀疏权重 (Softmax)
+        # 经过 Softmax 后，Top-k 频带权重总和为 1，其余为 0
+        routing_weights = F.softmax(scores_masked, dim=-1).unsqueeze(-1) # [B, K, 1]
+
+        # ================= Step C: 频带门控 (Band Gating) =================
+        # 只保留被路由选中的频带信息，抑制无关背景噪声
+        f_freq_routed = f_freq * routing_weights  # [B, K, D]
+
+        # ================= Step D: 空频交叉注意力 (Spatial -> Routed Freq) =================
+        # Residual connection
+        x_residual = f_loc
+
+        # 1. Linear Projections
+        # Query 来自 空间域 (Spatial)
+        q = self.q_proj(self.norm_loc(f_loc))           # [B, N, D]
+        # Key/Value 来自 筛选后的频率域 (Routed Frequency)
+        k = self.k_proj(self.norm_freq(f_freq_routed))  # [B, K, D]
+        v = self.v_proj(self.norm_freq(f_freq_routed))  # [B, K, D]
+
+        # 2. Standard Attention Calculation
+        # Q: [B, Heads, N, C], K: [B, Heads, K, C]
+        q = q.reshape(B, N, self.num_heads, D // self.num_heads).permute(0, 2, 1, 3)
+        k = k.reshape(B, K, self.num_heads, D // self.num_heads).permute(0, 2, 1, 3)
+        v = v.reshape(B, K, self.num_heads, D // self.num_heads).permute(0, 2, 1, 3)
+
+        # Attention Score: [B, Heads, N, K]
+        # 每一个空间 Patch 只关注 Top-K 个频带
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = F.softmax(attn, dim=-1)
+        attn = self.attn_drop(attn)
+
+        # Weighted Sum
+        x = (attn @ v).transpose(1, 2).reshape(B, N, D) # [B, N, D]
+        x = self.proj(x)
+        x = self.proj_drop(x)
+
+        # 3. Residual Add & Norm & FFN
+        f_loc_enhanced = x_residual + x
+        f_loc_enhanced = f_loc_enhanced + self.ffn(self.norm_ffn(f_loc_enhanced))
+
+        # ================= Step E: 生成物理取证向量 =================
+        # 对增强后的空间特征进行全局平均池化
+        v_phy = f_loc_enhanced.mean(dim=1) # [B, D]
+
+        return v_phy, f_loc_enhanced, routing_weights.squeeze(-1)
+
+
 class CrossAttentionFusion(nn.Module):
     """
     支路三 (A3)：Token-level Fusion + Evidence Pooling
