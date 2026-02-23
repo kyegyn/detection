@@ -567,39 +567,163 @@ class FinalClassifier(nn.Module):
         return self.net(x)
 
 
+# class ChannelWiseIndependentGatingFusion(nn.Module):
+#     """
+#     通道级独立双流门控机制 (Channel-wise Independent Dual-Stream Gating)
+#
+#     核心特性：
+#     1. Channel-wise: 输出权重是向量 [B, D]，实现特征维度的细粒度控制。
+#     2. Independent: 分别生成 alpha (语义权) 和 beta (物理权)，解除互斥约束，
+#        允许两者同时高（特征增强）或同时低（背景去噪）。
+#     """
+#
+#     def __init__(self, dim=256):
+#         super().__init__()
+#
+#         # 1. 共享特征提取器 (捕捉交互信息)
+#         self.shared_net = nn.Sequential(
+#             nn.Linear(dim * 4, dim),
+#             nn.LayerNorm(dim),  # 归一化稳定分布
+#             nn.ReLU()
+#         )
+#
+#         # 2. 独立门控头 A：生成语义流权重向量 alpha
+#         self.head_sem = nn.Sequential(
+#             nn.Linear(dim, dim),  # 输出维度 D (通道级)
+#             nn.Sigmoid()  # 范围 [0, 1]
+#         )
+#
+#         # 3. 独立门控头 B：生成物理流权重向量 beta
+#         self.head_phy = nn.Sequential(
+#             nn.Linear(dim, dim),  # 输出维度 D (通道级)
+#             nn.Sigmoid()  # 范围 [0, 1]
+#         )
+#
+#         # 4. 后处理归一化 (防止 alpha+beta > 1 导致特征幅值爆炸)
+#         self.post_norm = nn.LayerNorm(dim)
+#
+#     def forward(self, z_sem, v_forensic):
+#         """
+#         Args:
+#             z_sem: 语义特征 [B, D]
+#             v_forensic: 物理取证特征 [B, D]
+#         """
+#         # --- 1. 归一化与交互特征计算 ---
+#         z_sem_n = F.normalize(z_sem, p=2, dim=1)
+#         v_forensic_n = F.normalize(v_forensic, p=2, dim=1)
+#
+#         diff_feat = torch.abs(z_sem_n - v_forensic_n)  # 差异特征
+#         prod_feat = z_sem_n * v_forensic_n  # 共现特征
+#
+#         # 拼接所有信息 [B, D*4]
+#         combined = torch.cat([z_sem_n, v_forensic_n, diff_feat, prod_feat], dim=1)
+#
+#         # --- 2. 提取共享门控特征 ---
+#         gate_feat = self.shared_net(combined)
+#
+#         # --- 3. 生成两个独立的通道级权重向量 [B, D] ---
+#         alpha_vec = self.head_sem(gate_feat)  # 语义权重
+#         beta_vec = self.head_phy(gate_feat)  # 物理权重
+#
+#         # --- 4. 独立加权融合 ---
+#         # 允许 alpha + beta != 1，实现特征增强或抑制
+#         f_fused = alpha_vec * z_sem + beta_vec * v_forensic
+#
+#         # --- 5. 必须做 Post-Normalization ---
+#         # 因为不再是凸组合，幅值可能变化较大
+#         f_fused = self.post_norm(f_fused)
+#
+#         # --- 6. 返回结果 ---
+#         # 返回 alpha_vec 和 beta_vec 的均值，用于日志监控和正则化 Loss
+#         return f_fused, alpha_vec.mean(dim=1, keepdim=True), beta_vec.mean(dim=1, keepdim=True)
+
+
+class CompactBilinearPooling(nn.Module):
+    """
+    轻量级紧凑双线性池化 (Compact Bilinear Pooling - Factorized Approximation)
+    基于多模态分解双线性池化 (MFB) 思想，将传统 O(D^3) 的参数量大幅降至 O(D^2)，
+    高效捕获语义特征与物理特征之间的全局二阶协方差关联。
+    """
+    def __init__(self, dim1, dim2, out_dim, hidden_dim=None):
+        super().__init__()
+        # 扩展隐藏层维度以捕获更丰富的二阶交互 (通常为输出维度的 2~4 倍)
+        if hidden_dim is None:
+            hidden_dim = out_dim * 2
+
+        self.proj1 = nn.Linear(dim1, hidden_dim, bias=False)
+        self.proj2 = nn.Linear(dim2, hidden_dim, bias=False)
+        self.dropout = nn.Dropout(0.1)
+        self.proj_out = nn.Linear(hidden_dim, out_dim)
+
+    def forward(self, x1, x2):
+        # 1. 独立高维投影
+        h1 = self.proj1(x1)
+        h2 = self.proj2(x2)
+
+        # 2. 元素级相乘 (Hadamard Product, 近似模拟外积操作)
+        h_mul = self.dropout(h1 * h2)
+
+        # 3. 紧凑降维输出联合上下文特征
+        h_bil = self.proj_out(h_mul)
+        return h_bil
+
+
+class SwiGLU(nn.Module):
+    """
+    Swish-Gated Linear Unit (SwiGLU) 激活模块
+    引入大语言模型的前沿自门控机制，对高阶联合特征进行平滑的自适应非线性提纯。
+    """
+    def __init__(self, in_dim, out_dim=None):
+        super().__init__()
+        if out_dim is None:
+            out_dim = in_dim
+
+        # 拆分为两条并行路径
+        self.linear1 = nn.Linear(in_dim, out_dim)
+        self.linear2 = nn.Linear(in_dim, out_dim)
+        self.silu = nn.SiLU() # SiLU 即为 Swish 激活函数 x * sigmoid(x)
+
+    def forward(self, x):
+        # 路径 1: 纯线性变换
+        path1 = self.linear1(x)
+        # 路径 2: 线性变换 + SiLU 激活 (作为门控信号)
+        path2 = self.silu(self.linear2(x))
+
+        # 逐元素乘积进行自适应提纯
+        return path1 * path2
+
+
 class ChannelWiseIndependentGatingFusion(nn.Module):
-    """
-    通道级独立双流门控机制 (Channel-wise Independent Dual-Stream Gating)
 
-    核心特性：
-    1. Channel-wise: 输出权重是向量 [B, D]，实现特征维度的细粒度控制。
-    2. Independent: 分别生成 alpha (语义权) 和 beta (物理权)，解除互斥约束，
-       允许两者同时高（特征增强）或同时低（背景去噪）。
     """
-
+    融合了 CBP、SwiGLU 与残差映射的高阶通道级独立双流门控机制
+    (Channel-wise Independent Gating Fusion with CBP & SwiGLU)
+    """
     def __init__(self, dim=256):
         super().__init__()
 
-        # 1. 共享特征提取器 (捕捉交互信息)
-        self.shared_net = nn.Sequential(
-            nn.Linear(dim * 4, dim),
-            nn.LayerNorm(dim),  # 归一化稳定分布
-            nn.ReLU()
-        )
+        # 1. 紧凑双线性池化层 (High-order Interaction)
+        self.cbp = CompactBilinearPooling(dim1=dim, dim2=dim, out_dim=dim)
 
-        # 2. 独立门控头 A：生成语义流权重向量 alpha
+        # 2. SwiGLU 提纯模块 (Purification)
+        self.swiglu = SwiGLU(in_dim=dim, out_dim=dim)
+
+        # 3. 门控编码块的残差归一化层 (Stabilization)
+        self.norm_gate = nn.LayerNorm(dim)
+
+        # 4. 独立门控头 A：生成语义流权重向量 alpha
         self.head_sem = nn.Sequential(
             nn.Linear(dim, dim),  # 输出维度 D (通道级)
-            nn.Sigmoid()  # 范围 [0, 1]
+            nn.Sigmoid()          # 解除 Softmax 互斥，范围 [0, 1]
         )
 
-        # 3. 独立门控头 B：生成物理流权重向量 beta
+        # 5. 独立门控头 B：生成物理流权重向量 beta
         self.head_phy = nn.Sequential(
-            nn.Linear(dim, dim),  # 输出维度 D (通道级)
-            nn.Sigmoid()  # 范围 [0, 1]
+            nn.Linear(dim, dim),
+            nn.Sigmoid()
         )
 
-        # 4. 后处理归一化 (防止 alpha+beta > 1 导致特征幅值爆炸)
+        # 6. 后处理归一化层 (Dynamic Fusion)
         self.post_norm = nn.LayerNorm(dim)
 
     def forward(self, z_sem, v_forensic):
@@ -608,31 +732,29 @@ class ChannelWiseIndependentGatingFusion(nn.Module):
             z_sem: 语义特征 [B, D]
             v_forensic: 物理取证特征 [B, D]
         """
-        # --- 1. 归一化与交互特征计算 ---
-        z_sem_n = F.normalize(z_sem, p=2, dim=1)
-        v_forensic_n = F.normalize(v_forensic, p=2, dim=1)
+        # --- 1. 双线性协方差交互 (CBP) ---
+        # 提取跨模态二阶上下文表征，替代粗糙的拼接与绝对差值
+        h_bil = self.cbp(z_sem, v_forensic)  # [B, D]
 
-        diff_feat = torch.abs(z_sem_n - v_forensic_n)  # 差异特征
-        prod_feat = z_sem_n * v_forensic_n  # 共现特征
+        # --- 2. SwiGLU 自门控提纯与残差映射 ---
+        h_distil = self.swiglu(h_bil)        # 过滤冗余噪声 [B, D]
 
-        # 拼接所有信息 [B, D*4]
-        combined = torch.cat([z_sem_n, v_forensic_n, diff_feat, prod_feat], dim=1)
+        # 残差连接 (h_bil + h_distil) 保证梯度直达并保留原始关联
+        # LayerNorm 稳定高阶交互后的流形分布
+        h_gate = self.norm_gate(h_bil + h_distil) # [B, D]
 
-        # --- 2. 提取共享门控特征 ---
-        gate_feat = self.shared_net(combined)
+        # --- 3. 生成独立通道级权重向量 ---
+        alpha_vec = self.head_sem(h_gate)    # 语义权重 [B, D]
+        beta_vec  = self.head_phy(h_gate)    # 物理权重 [B, D]
 
-        # --- 3. 生成两个独立的通道级权重向量 [B, D] ---
-        alpha_vec = self.head_sem(gate_feat)  # 语义权重
-        beta_vec = self.head_phy(gate_feat)  # 物理权重
-
-        # --- 4. 独立加权融合 ---
-        # 允许 alpha + beta != 1，实现特征增强或抑制
+        # --- 4. 独立加权动态融合 ---
+        # 允许 alpha + beta != 1，支持互补、增强、抑制三种宏观决策模式
         f_fused = alpha_vec * z_sem + beta_vec * v_forensic
 
-        # --- 5. 必须做 Post-Normalization ---
-        # 因为不再是凸组合，幅值可能变化较大
+        # --- 5. 融合后归一化 ---
+        # 稳定加权相加后的特征幅值
         f_fused = self.post_norm(f_fused)
 
         # --- 6. 返回结果 ---
-        # 返回 alpha_vec 和 beta_vec 的均值，用于日志监控和正则化 Loss
+        # 返回融合特征，以及权重的标量均值 (用于记录日志和正则化 Loss)
         return f_fused, alpha_vec.mean(dim=1, keepdim=True), beta_vec.mean(dim=1, keepdim=True)
