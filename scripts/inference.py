@@ -156,7 +156,7 @@ def evaluate_on_multiple_val_dirs(model, config, val_dirs: list[str]):
             continue
         # 打印验证集名称，方便日志定位
         dirname = os.path.basename(vdir.rstrip('/\\'))
-        print(f"\n{'='*10} Evaluating on: {dirname} {'='*10}")
+        print(f"\n{'='*10} Evaluating on: {vdir} {'='*10}")
         val_loader = build_val_loader(config, val_root=vdir)
         metrics = evaluate_on_val(model, val_loader, config)
         results.append((vdir, metrics))

@@ -640,32 +640,84 @@ class FinalClassifier(nn.Module):
 
 class CompactBilinearPooling(nn.Module):
     """
-    轻量级紧凑双线性池化 (Compact Bilinear Pooling - Factorized Approximation)
-    基于多模态分解双线性池化 (MFB) 思想，将传统 O(D^3) 的参数量大幅降至 O(D^2)，
-    高效捕获语义特征与物理特征之间的全局二阶协方差关联。
+    基于 FFT 的标准紧凑双线性池化 (MCB) 实现
+    对应论文公式: h_cbp = IFFT(FFT(CountSketch(x)) * FFT(CountSketch(y)))
     """
     def __init__(self, dim1, dim2, out_dim, hidden_dim=None):
+        """
+        Args:
+            dim1: 输入特征 1 的维度
+            dim2: 输入特征 2 的维度
+            out_dim: 输出特征的维度 (对应论文中的 FFT 长度)
+            hidden_dim: (MCB中不使用此参数，仅为了保持接口兼容性保留)
+        """
         super().__init__()
-        # 扩展隐藏层维度以捕获更丰富的二阶交互 (通常为输出维度的 2~4 倍)
-        if hidden_dim is None:
-            hidden_dim = out_dim * 2
+        self.dim1 = dim1
+        self.dim2 = dim2
+        self.out_dim = out_dim
 
-        self.proj1 = nn.Linear(dim1, hidden_dim, bias=False)
-        self.proj2 = nn.Linear(dim2, hidden_dim, bias=False)
-        self.dropout = nn.Dropout(0.1)
-        self.proj_out = nn.Linear(hidden_dim, out_dim)
+        # --- Count Sketch 参数初始化 ---
+        # 随机生成哈希索引 h: [0, out_dim-1]
+        # 随机生成符号翻转 s: {-1, 1}
+        # 使用 register_buffer 确保它们是模型的一部分但不可训练（固定随机投影）
+        self.register_buffer('h1', torch.randint(0, out_dim, (dim1,)))
+        self.register_buffer('s1', torch.randint(0, 2, (dim1,)) * 2 - 1) # {-1, 1}
+
+        self.register_buffer('h2', torch.randint(0, out_dim, (dim2,)))
+        self.register_buffer('s2', torch.randint(0, 2, (dim2,)) * 2 - 1) # {-1, 1}
+
+    def count_sketch(self, x, h, s):
+        """
+        执行 Count Sketch 投影
+        x: [B, D_in]
+        h: [D_in]
+        s: [D_in]
+        return: [B, out_dim]
+        """
+        B = x.shape[0]
+        # 初始化输出 tensor
+        out = torch.zeros(B, self.out_dim, device=x.device, dtype=x.dtype)
+
+        # 扩展 s 和 h 以匹配 batch 维度
+        # x * s: 随机符号翻转
+        # scatter_add_: 根据索引 h 将值累加到 out 中
+        out.scatter_add_(1, h.expand(B, -1), x * s.expand(B, -1))
+
+        return out
 
     def forward(self, x1, x2):
-        # 1. 独立高维投影
-        h1 = self.proj1(x1)
-        h2 = self.proj2(x2)
+        """
+        x1: [B, dim1]
+        x2: [B, dim2]
+        """
+        # 1. Count Sketch 投影
+        sketch1 = self.count_sketch(x1, self.h1, self.s1)
+        sketch2 = self.count_sketch(x2, self.h2, self.s2)
 
-        # 2. 元素级相乘 (Hadamard Product, 近似模拟外积操作)
-        h_mul = self.dropout(h1 * h2)
+        # 2. FFT 变换
+        fft1 = torch.fft.rfft(sketch1)
+        fft2 = torch.fft.rfft(sketch2)
 
-        # 3. 紧凑降维输出联合上下文特征
-        h_bil = self.proj_out(h_mul)
-        return h_bil
+        # 3. 频域逐元素乘积
+        fft_product = fft1 * fft2
+
+        # 4. IFFT 逆变换
+        cbp_out = torch.fft.irfft(fft_product, n=self.out_dim)
+
+        # ==========================================
+        # [关键修复] 增加数值稳定性归一化
+        # ==========================================
+
+        # 5. Signed Square Root Normalization (SSR)
+        # 作用：压缩数值范围，降低偏度，防止过大值主导
+        # y = sign(x) * sqrt(|x|)
+        cbp_out = torch.sign(cbp_out) * torch.sqrt(torch.abs(cbp_out) + 1e-8)
+
+        # 6. L2 Normalization
+        # 作用：将特征向量投射到单位球面上，防止能量爆炸
+        cbp_out = F.normalize(cbp_out, p=2, dim=1)
+
+        return cbp_out
 
 
 class SwiGLU(nn.Module):
