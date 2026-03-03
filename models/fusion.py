@@ -746,33 +746,39 @@ class SwiGLU(nn.Module):
 
 
 class ChannelWiseIndependentGatingFusion(nn.Module):
-
     """
-    融合了 CBP、SwiGLU 与残差映射的高阶通道级独立双流门控机制
-    (Channel-wise Independent Gating Fusion with CBP & SwiGLU)
+    4.4.2 基于双线性残差门控的特征重标定
+    (Bilinear Residual Gating for Feature Recalibration)
+
+    核心特性：
+    1. Residual Gating: 使用 (1+alpha) 形式，保证梯度无损传播，解决冷启动问题。
+    2. Dual-Stream Independent: alpha, beta 互不依赖，允许同时增强或抑制。
+    3. Tanh Activation: 输出范围 [-1, 1]，支持正向增强和负向抑制。
     """
     def __init__(self, dim=256):
         super().__init__()
 
         # 1. 紧凑双线性池化层 (High-order Interaction)
+        # 提取跨模态二阶上下文表征 z_ctx
         self.cbp = CompactBilinearPooling(dim1=dim, dim2=dim, out_dim=dim)
 
         # 2. SwiGLU 提纯模块 (Purification)
+        # 对高阶特征进行非线性筛选
         self.swiglu = SwiGLU(in_dim=dim, out_dim=dim)
 
         # 3. 门控编码块的残差归一化层 (Stabilization)
         self.norm_gate = nn.LayerNorm(dim)
 
-        # 4. 独立门控头 A：生成语义流权重向量 alpha
+        # 4. 独立门控头 A：生成语义流残差 alpha
         self.head_sem = nn.Sequential(
-            nn.Linear(dim, dim),  # 输出维度 D (通道级)
-            nn.Sigmoid()          # 解除 Softmax 互斥，范围 [0, 1]
+            nn.Linear(dim, dim),
+            nn.Tanh()  # [修改] 改为 Tanh，输出范围 [-1, 1]
         )
 
-        # 5. 独立门控头 B：生成物理流权重向量 beta
+        # 5. 独立门控头 B：生成物理流残差 beta
         self.head_phy = nn.Sequential(
             nn.Linear(dim, dim),
-            nn.Sigmoid()
+            nn.Tanh()  # [修改] 改为 Tanh，输出范围 [-1, 1]
         )
 
         # 6. 后处理归一化层 (Dynamic Fusion)
@@ -781,32 +787,88 @@ class ChannelWiseIndependentGatingFusion(nn.Module):
     def forward(self, z_sem, v_forensic):
         """
         Args:
-            z_sem: 语义特征 [B, D]
+            z_sem:      语义特征 [B, D]
             v_forensic: 物理取证特征 [B, D]
+        Returns:
+            f_fused:    融合后的特征 [B, D]
+            alpha_vec:  语义残差向量 [B, D] (用于正则化)
+            beta_vec:   物理残差向量 [B, D] (用于正则化)
         """
         # --- 1. 双线性协方差交互 (CBP) ---
-        # 提取跨模态二阶上下文表征，替代粗糙的拼接与绝对差值
+        # z_ctx = CBP(z, v)
         h_bil = self.cbp(z_sem, v_forensic)  # [B, D]
 
         # --- 2. SwiGLU 自门控提纯与残差映射 ---
-        h_distil = self.swiglu(h_bil)        # 过滤冗余噪声 [B, D]
-
-        # 残差连接 (h_bil + h_distil) 保证梯度直达并保留原始关联
-        # LayerNorm 稳定高阶交互后的流形分布
+        # z_ctx_refined = SwiGLU(z_ctx) + z_ctx
+        h_distil = self.swiglu(h_bil)
         h_gate = self.norm_gate(h_bil + h_distil) # [B, D]
 
-        # --- 3. 生成独立通道级权重向量 ---
-        alpha_vec = self.head_sem(h_gate)    # 语义权重 [B, D]
-        beta_vec  = self.head_phy(h_gate)    # 物理权重 [B, D]
+        # --- 3. 生成独立通道级残差向量 (范围 -1 ~ 1) ---
+        alpha_vec = self.head_sem(h_gate)    # 语义残差 alpha
+        beta_vec  = self.head_phy(h_gate)    # 物理残差 beta
 
-        # --- 4. 独立加权动态融合 ---
-        # 允许 alpha + beta != 1，支持互补、增强、抑制三种宏观决策模式
-        f_fused = alpha_vec * z_sem + beta_vec * v_forensic
+        # --- 4. [修改] 残差化动态融合 (Residual Recalibration) ---
+        # f = (1 + alpha) * z + (1 + beta) * v
+        # 初始状态下 alpha, beta -> 0，模型退化为 z + v (稳健的加法融合)
+        # alpha > 0: 增强; alpha < 0: 抑制
+        f_sem_recalib = (1 + alpha_vec) * z_sem
+        f_phy_recalib = (1 + beta_vec) * v_forensic
+
+        f_fused = f_sem_recalib + f_phy_recalib
 
         # --- 5. 融合后归一化 ---
-        # 稳定加权相加后的特征幅值
         f_fused = self.post_norm(f_fused)
 
         # --- 6. 返回结果 ---
-        # 返回融合特征，以及权重的标量均值 (用于记录日志和正则化 Loss)
-        return f_fused, alpha_vec.mean(dim=1, keepdim=True), beta_vec.mean(dim=1, keepdim=True)
+        # 注意：这里直接返回 alpha_vec 和 beta_vec (B, D)，
+        # 具体均值计算交给 Loss 函数处理，保留通道级信息。
+        return f_fused, alpha_vec, beta_vec
+
+class GatingDiversityLoss(nn.Module):
+    """
+    4.5.3 门控多样性正则化 (Gating Diversity Regularization)
+
+    理论依据：
+    防止门控网络陷入“模式坍塌”(Mode Collapse)，即输出静态的平均权重。
+    强制要求 Batch 内的门控系数标准差 (Std) 至少达到 sigma_min。
+
+    公式：
+    L_div = [ReLU(sigma_min - Std(alpha))]^2 + [ReLU(sigma_min - Std(beta))]^2
+    """
+    def __init__(self, sigma_min=0.05, eps=1e-6):
+        super().__init__()
+        self.sigma_min = sigma_min
+        self.eps = eps
+
+    def forward(self, alpha, beta):
+        """
+        Args:
+            alpha: [B, 1] 或 [B, D] 语义流门控系数
+            beta:  [B, 1] 或 [B, D] 物理流门控系数
+        """
+        # 1. 如果输入是通道级的 [B, D]，先计算通道均值 -> [B]
+        if alpha.dim() > 1:
+            alpha_mean = alpha.mean(dim=1)
+        else:
+            alpha_mean = alpha
+
+        if beta.dim() > 1:
+            beta_mean = beta.mean(dim=1)
+        else:
+            beta_mean = beta
+
+        # 2. Batch size 检查 (小于2无法计算方差)
+        B = alpha_mean.size(0)
+        if B < 2:
+            return torch.tensor(0.0, device=alpha.device)
+
+        # 3. 计算 Batch 维度的标准差
+        std_alpha = torch.std(alpha_mean)
+        std_beta = torch.std(beta_mean)
+
+        # 4. Hinge Loss 计算
+        # 只有当 Std < sigma_min 时才产生惩罚
+        loss_alpha = torch.relu(self.sigma_min - std_alpha) ** 2
+        loss_beta = torch.relu(self.sigma_min - std_beta) ** 2
+
+        return loss_alpha + loss_beta

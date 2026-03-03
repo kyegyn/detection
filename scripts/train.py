@@ -30,7 +30,7 @@ from losses.supcon_loss import SupConLoss
 from utils.fft_utils import seed_everything
 from utils.metrics import BinaryMetrics
 from utils.logger import ExperimentLogger
-from models.fusion import OrthogonalLoss, FineGrainedDecorrelationLoss
+from models.fusion import GatingDiversityLoss, FineGrainedDecorrelationLoss
 
 
 # --- 1. 定义在全局范围 ---
@@ -77,7 +77,8 @@ def train():
         transforms.Normalize((0.4814, 0.4578, 0.4082), (0.2686, 0.2613, 0.2757))
     ])
 
-    train_ds = ForensicDataset(root_dir='/root/autodl-tmp/data2/train', transform=train_transform)
+    train_ds = ForensicDataset(root_dir='/root/autodl-tmp/data/train', transform=train_transform)
+    # train_ds = ForensicDataset(root_dir='/root/autodl-tmp/data2/train', transform=train_transform)
     val_ds = ForensicDataset(root_dir='/root/autodl-tmp/data/val', transform=train_transform)
 
     train_loader = DataLoader(train_ds, batch_size=config['batch_size'], shuffle=True, num_workers=4,
@@ -129,7 +130,8 @@ def train():
     # criterion_supcon = SupConLoss(temperature=config['temp'])
     # criterion_orth = OrthogonalLoss()
     criterion_decorr = FineGrainedDecorrelationLoss()
-
+    sigma_min = config.get('div_sigma_min', 0.05)
+    criterion_div = GatingDiversityLoss(sigma_min=sigma_min)
     scaler = GradScaler('cuda')
 
     # --- 5. 训练循环 ---
@@ -162,7 +164,7 @@ def train():
 
                 # loss_orth_val = 0.0
                 loss_decorr_val = 0.0
-                loss_reg = 0.0
+                loss_div_val = 0.0
                 if config.get('fusion_type') == 'gating':
                     # loss_orth_val = criterion_orth(f_sem_raw, v_forensic)
                     # total_loss += config.get('lambda_orth', 0.1) * loss_orth_val
@@ -192,16 +194,14 @@ def train():
             val_sc  = 0
             # val_orth = loss_orth_val.item() if isinstance(loss_orth_val, torch.Tensor) else 0.0
             val_decorr = loss_decorr_val.item() if isinstance(loss_decorr_val, torch.Tensor) else 0.0
-            val_reg = loss_reg.item() if 'loss_entropy' in locals() and isinstance(loss_reg, torch.Tensor) else 0.0
-
+            val_div = loss_div_val.item() if isinstance(loss_div_val, torch.Tensor) else 0.0 # 记录新损失
             # 记录日志
             global_step = epoch * len(train_loader) + batch_idx
             losses_dict = {
                 'total': total_loss.item(),
                 'bce': val_bce,
-                # 'supcon': val_sc,
                 'decorr': val_decorr,
-                'reg': val_reg,
+                'div': val_div,
             }
             logger.log_step(epoch, batch_idx, global_step, losses_dict)
 
@@ -222,7 +222,7 @@ def train():
                 loss_detail = f"Loss: {total_loss.item():.4f} [BCE:{val_bce:.4f} SC:{val_sc:.4f}"
                 # 如果有 gating 相关的损失，也打印出来
                 if config.get('fusion_type') == 'gating':
-                    loss_detail += f" Decorr:{val_decorr:.4f} Reg:{val_reg:.4f}"
+                    loss_detail = f"Loss: {total_loss.item():.4f} [BCE:{val_bce:.4f}"
                     if alpha is not None:
                         with torch.no_grad():
                             alpha_t = alpha.squeeze()  # [B]

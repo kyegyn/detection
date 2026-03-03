@@ -14,7 +14,7 @@ lambda_supcon: 0 # 语义聚类损失权重 0.5
 save_path: './checkpoints'
 logs_path: './logs'
 resume_epoch: 10 # 举例：你想从第 {resume_epoch} epoch 继续，{不包括resume_epoch}，{从resume_epoch}+1开始;重新开始为0
-exp_name: exp_20260301_214337_seed3407
+#exp_name: exp_20260301_214337_seed3407
 use_lora: True    # 是否使用 LoRA 微调，False 则为解冻少部分参数。建议使用 True
 # 可选值: 'concat' | 'discrepancy' | 'gating'
 fusion_type: 'gating'
@@ -22,7 +22,8 @@ fusion_type: 'gating'
 lambda_orth: 0.001
 lambda_gate: 0.01
 lambda_decorr: 0.001
-lambda_l1: 0.0001
+#lambda_l1: 0.0001
+lambda_div: 0.01
 # 推理：
 # 验证集目录，多个用','隔开
 VAL_DIRS: "/root/autodl-tmp/data/val,/root/autodl-tmp/adm/val,/root/autodl-tmp/biggan/val,/root/autodl-tmp/glide/val,/root/autodl-tmp/midjourney/val,/root/autodl-tmp/sdv5/val,/root/autodl-tmp/vqdm/val,/root/autodl-tmp/wukong/val"
