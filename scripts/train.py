@@ -77,8 +77,8 @@ def train():
         transforms.Normalize((0.4814, 0.4578, 0.4082), (0.2686, 0.2613, 0.2757))
     ])
 
-    train_ds = ForensicDataset(root_dir='/root/autodl-tmp/data/train', transform=train_transform)
-    # train_ds = ForensicDataset(root_dir='/root/autodl-tmp/data2/train', transform=train_transform)
+    # train_ds = ForensicDataset(root_dir='/root/autodl-tmp/data/train', transform=train_transform)
+    train_ds = ForensicDataset(root_dir='/root/autodl-tmp/data2/train', transform=train_transform)
     val_ds = ForensicDataset(root_dir='/root/autodl-tmp/data/val', transform=train_transform)
 
     train_loader = DataLoader(train_ds, batch_size=config['batch_size'], shuffle=True, num_workers=4,

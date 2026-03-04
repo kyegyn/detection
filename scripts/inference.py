@@ -80,7 +80,7 @@ def evaluate_on_val(model, val_loader, config):
             evaluator.update(logits.squeeze(), labels)
 
             # --- 收集自测数据 (仅在 Gating 模式下有效) ---
-            if alpha is not None:
+            if alpha is None:
                 # 确保 Classifier 输入维度匹配 (Gating 模式下 embed_dim 对齐)
                 # 如果是 Concat 模式，Classifier 输入维度是 2*dim，这里会报错，需跳过
                 if hasattr(model.classifier, 'net') and \

@@ -6,10 +6,12 @@ def delete_specific_images():
     ai_dir = "/root/autodl-tmp/data2/train/ai"
     # 匹配格式：数字_adm_数字.PNG（支持任意位数的数字）
     # pattern = re.compile(r'^GLIDE_\d+_\d+_\d+_\d+_glide_\d+\.png$', re.IGNORECASE)
-    pattern = re.compile(r'^\d+_adm_\d+\.PNG$', re.IGNORECASE)
+    # pattern = re.compile(r'^\d+_adm_\d+\.PNG$', re.IGNORECASE)
+    # pattern = re.compile(r'^\d+_wukong_image\d+\.PNG$', re.IGNORECASE)
     # pattern = re.compile(r'^\d+_biggan_\d+\.PNG$', re.IGNORECASE)
+    pattern = re.compile(r'^\d+_midjourney_\d+\.PNG$', re.IGNORECASE)
     # 要删除的文件数量
-    delete_count = 1000
+    delete_count = 500
 
     # 1. 遍历目录，筛选符合条件的文件
     target_files = []
