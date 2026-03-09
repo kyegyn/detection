@@ -14,7 +14,7 @@ lambda_supcon: 0 # 语义聚类损失权重 0.5
 save_path: './checkpoints'
 logs_path: './logs'
 resume_epoch: 20 # 举例：你想从第 {resume_epoch} epoch 继续，{不包括resume_epoch}，{从resume_epoch}+1开始;重新开始为0
-exp_name: exp_20260304_195607_seed3407
+#exp_name: exp_20260304_195607_seed3407
 use_lora: True    # 是否使用 LoRA 微调，False 则为解冻少部分参数。建议使用 True
 # 可选值: 'concat' | 'discrepancy' | 'gating'
 fusion_type: 'gating'

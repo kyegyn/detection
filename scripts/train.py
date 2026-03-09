@@ -77,8 +77,8 @@ def train():
         transforms.Normalize((0.4814, 0.4578, 0.4082), (0.2686, 0.2613, 0.2757))
     ])
 
-    # train_ds = ForensicDataset(root_dir='/root/autodl-tmp/data/train', transform=train_transform)
-    train_ds = ForensicDataset(root_dir='/root/autodl-tmp/data2/train', transform=train_transform)
+    train_ds = ForensicDataset(root_dir='/root/autodl-tmp/data/train', transform=train_transform)
+    # train_ds = ForensicDataset(root_dir='/root/autodl-tmp/data2/train', transform=train_transform)
     val_ds = ForensicDataset(root_dir='/root/autodl-tmp/data/val', transform=train_transform)
 
     train_loader = DataLoader(train_ds, batch_size=config['batch_size'], shuffle=True, num_workers=4,
@@ -158,11 +158,8 @@ def train():
 
                 # 计算损失
                 loss_bce = criterion_bce(logits.squeeze(), labels)
-                # loss_sc = criterion_supcon(z_sem, labels)
-                # total_loss = loss_bce + config.get('lambda_supcon', 0) * loss_sc
                 total_loss = loss_bce
 
-                # loss_orth_val = 0.0
                 loss_decorr_val = 0.0
                 loss_div_val = 0.0
                 if config.get('fusion_type') == 'gating':
@@ -170,17 +167,8 @@ def train():
                     # total_loss += config.get('lambda_orth', 0.1) * loss_orth_val
                     loss_decorr_val = criterion_decorr(f_sem_raw.detach(), f_tex_global, z_freq)
                     total_loss += config.get('lambda_decorr', 0.01) * loss_decorr_val
-                    if alpha is not None and beta is not None:
-                        # 稀疏正则化：鼓励权重中有 0 (抑制无效特征)
-                        # 权重系数建议给小一点，例如 1e-4
-                        reg_loss = (torch.mean(torch.abs(alpha)) + torch.mean(torch.abs(beta))) * config.get('lambda_l1', 0.0001)
-                        total_loss += reg_loss
-                # ---------------------------------------------------
-                # 【新增】计算 Gating Regularization Loss
-                # ---------------------------------------------------
-                loss_gate_val = 0.0
-
-
+                    loss_div_val = criterion_div(alpha, beta)
+                    total_loss += config.get('lambda_div', 0.01) * loss_div_val
             # 反向传播与更新
             scaler.scale(total_loss).backward()
             scaler.unscale_(optimizer)
