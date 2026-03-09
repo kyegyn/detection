@@ -142,7 +142,6 @@ def train():
         train_loss = 0.0
         correct = 0
         total = 0
-        base_entropy = config.get('lambda_entropy', 0.01)
         # 获取当前学习率用于打印
         current_lr = optimizer.param_groups[0]['lr']
 
@@ -163,12 +162,15 @@ def train():
                 loss_decorr_val = 0.0
                 loss_div_val = 0.0
                 if config.get('fusion_type') == 'gating':
-                    # loss_orth_val = criterion_orth(f_sem_raw, v_forensic)
-                    # total_loss += config.get('lambda_orth', 0.1) * loss_orth_val
-                    loss_decorr_val = criterion_decorr(f_sem_raw.detach(), f_tex_global, z_freq)
-                    total_loss += config.get('lambda_decorr', 0.01) * loss_decorr_val
-                    loss_div_val = criterion_div(alpha, beta)
-                    total_loss += config.get('lambda_div', 0.01) * loss_div_val
+                    # 1. 计算特征去相关损失 (需要物理特征存在)
+                    if f_tex_global is not None and z_freq is not None:
+                        loss_decorr_val = criterion_decorr(f_sem_raw.detach(), f_tex_global, z_freq)
+                        total_loss += config.get('lambda_decorr', 0.01) * loss_decorr_val
+
+                    # 2. 计算门控多样性损失 (需要门控系数存在)
+                    if alpha is not None and beta is not None:
+                        loss_div_val = criterion_div(alpha, beta)
+                        total_loss += config.get('lambda_div', 0.01) * loss_div_val
             # 反向传播与更新
             scaler.scale(total_loss).backward()
             scaler.unscale_(optimizer)
@@ -178,9 +180,7 @@ def train():
 
             # 为了防止变量未定义，先获取数值（安全获取）
             val_bce = loss_bce.item()
-            # val_sc  = loss_sc.item()
             val_sc  = 0
-            # val_orth = loss_orth_val.item() if isinstance(loss_orth_val, torch.Tensor) else 0.0
             val_decorr = loss_decorr_val.item() if isinstance(loss_decorr_val, torch.Tensor) else 0.0
             val_div = loss_div_val.item() if isinstance(loss_div_val, torch.Tensor) else 0.0 # 记录新损失
             # 记录日志
@@ -230,9 +230,10 @@ def train():
                 logger.log_file_only(
                     f"Epoch [{epoch + 1}] Step [{batch_idx}] LR: {current_lr:.6f} | {loss_detail} | Acc: {correct / total:.4f} | {mem_info}"
                 )
-                logger.log_file_only(
-                    f"Epoch [{epoch + 1}] Step [{batch_idx}] alpha: mean={alpha.mean().item():.4f}, min={alpha.min().item():.4f}, max={alpha.max().item():.4f}"
-                )
+                if alpha is not None:
+                    logger.log_file_only(
+                        f"Epoch [{epoch + 1}] Step [{batch_idx}] alpha: mean={alpha.mean().item():.4f}, min={alpha.min().item():.4f}, max={alpha.max().item():.4f}"
+                    )
 
             loop.set_description(f"Epoch [{epoch + 1}/{config['epochs']}]")
             loop.set_postfix(loss=total_loss.item(), acc=correct / total, lr=current_lr)

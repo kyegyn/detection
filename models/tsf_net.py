@@ -1,12 +1,11 @@
 import torch
 import torch.nn as nn
-
-# 导入所有子模块
 from .branches.semantic import SemanticBranch
 from .branches.local_patch import LocalPatchBranch
 from .branches.global_freq import GlobalFreqBranch
-from .fusion import (CrossAttentionFusion, FinalClassifier, DiscrepancyFusion,
-                     GatingFusion, AgentAttentionFusion, ChannelWiseIndependentGatingFusion, SparseSpatialFrequencyAttention)
+from .fusion import (FinalClassifier, DiscrepancyFusion,
+                     GatingFusion, ChannelWiseIndependentGatingFusion,
+                     SparseSpatialFrequencyAttention)
 
 
 class TSFNet(nn.Module):
@@ -21,6 +20,10 @@ class TSFNet(nn.Module):
         """
         super(TSFNet, self).__init__()
         self.config = config
+        self.ablation_mode = config.get('ablation_mode', 'full')
+        self.fusion_type = config.get('fusion_type', 'concat')
+        embed_dim = config['embed_dim']
+        print(f"🔬 Ablation Mode: {self.ablation_mode}")
         # --- 1. 实例化三大支路 ---
         # 支路一：语义流 (CLIP) - 内部处理加载与 LoRA
         self.branch1 = SemanticBranch(config)
@@ -37,16 +40,6 @@ class TSFNet(nn.Module):
         )
 
         # # --- 2. 实例化融合模块 ---
-        # self.fusion = CrossAttentionFusion(
-        #     embed_dim=config['embed_dim'],
-        #     num_heads=8
-        # )
-        # print("🚀 Using Sparse Agent Attention Fusion (Top-K Denoising)")
-        # self.fusion = AgentAttentionFusion(
-        #     embed_dim=config['embed_dim'],
-        #     num_heads=8,
-        #     dropout=0.1
-        # )
         print("🚀 Using Sparse Spatial Frequency Attention Fusion")
         self.fusion = SparseSpatialFrequencyAttention(
             dim=embed_dim,
@@ -55,7 +48,6 @@ class TSFNet(nn.Module):
         )
         # --- 3. 高级融合策略选择 (Switch) ---
         # 默认为 'concat' (老方法), 可选 'discrepancy' (情况1), 'gating' (情况2)
-        self.fusion_type = config.get('fusion_type', 'concat')
 
         if self.fusion_type == 'discrepancy':
             print("🚀 Using Strategy 1: Discrepancy-Aware Fusion")
@@ -74,63 +66,112 @@ class TSFNet(nn.Module):
             self.adv_fusion = None
             cls_input_dim = embed_dim + config['projection_dim'] # 拼接后维度 D + D
 
+        if self.ablation_mode in ['semantic_only', 'texture_only', 'freq_only']:
+            # 单支路：输入维度 = embed_dim
+            # 注意：SemanticBranch 的 projector 输出是 projection_dim (通常等于 embed_dim，配置里确认)
+            cls_input_dim = config['projection_dim']
 
-        # --- 3. 实例化分类头 ---
+        elif self.ablation_mode == 'naive_concat':
+            # 朴素拼接：语义 + 纹理(GlobalPool) + 频率(GlobalPool)
+            # 维度 = D + D + D = 3*D
+            cls_input_dim = config['projection_dim'] + embed_dim + embed_dim
+
+        elif self.ablation_mode == 'with_ssfa':
+            # 引入 SSFA 后，物理流被聚合成一个向量 v_forensic (D)
+            # 融合方式为 Concat: Semantic (D) + Forensic (D) = 2*D
+            cls_input_dim = config['projection_dim'] + embed_dim
+
+        elif self.ablation_mode == 'full':
+            # 完整模型：CIGF 融合后输出 D
+            cls_input_dim = embed_dim
+
+        else:
+            # 默认 fallback
+            cls_input_dim = embed_dim * 2
+        print(f"📏 Classifier Input Dim: {cls_input_dim}")
         self.classifier = FinalClassifier(input_dim=cls_input_dim, hidden_dim=256)
 
     def forward(self, img):
-        """
-        Args:
-            img: 原始图像 Tensor [B, 3, 224, 224]
+        # 初始化变量
+        z_sem_norm, f_sem_raw = None, None
+        f_loc, f_tex_global = None, None
+        z_freq = None
+        v_forensic = None
+        alpha, beta = None, None
+        attn_weights = None
+        logits = None
 
-        注意：当使用 LoRA 时，CLIP 是可训练的，因此必须输入原始图像，
-        不能再使用 train.py 里那种 `with torch.no_grad(): clip(img)` 预提取的方式。
-        """
+        # ==========================================
+        # 1. 特征提取阶段 (根据消融模式执行)
+        # ==========================================
 
-        # --- Step 1: 支路一 (语义) ---
-        # z_sem_norm: 用于 SupCon Loss
-        # f_sem_raw:  用于融合
-        z_sem_norm, f_sem_raw = self.branch1(img)
+        # 语义流
+        if self.ablation_mode in ['semantic_only', 'naive_concat', 'with_ssfa', 'full']:
+            z_sem_norm, f_sem_raw = self.branch1(img)
 
-        # --- Step 2: 支路二 (局部) ---
-        f_loc = self.branch2(img)
-        f_tex_global = f_loc.mean(dim=1)
-        # --- Step 3: 支路三 (全局) ---
-        z_freq = self.branch3(img)
+        # 纹理流
+        if self.ablation_mode in ['texture_only', 'naive_concat', 'with_ssfa', 'full']:
+            f_loc = self.branch2(img)
+            f_tex_global = f_loc.mean(dim=1)  # GAP 作为全局纹理特征
 
-        # --- Step 4: 交叉注意力融合 ---
-        v_forensic, attn_weights, x_seq = self.fusion(f_loc, z_freq)
-        # f_loc_enhanced, v_phy, routing_weights = self.fusion(f_loc, z_freq)
-        # logits, f_fused, alpha, beta = self.fusion(z_sem, v_phy)
-        # =======================================================
-        # 【核心修改 Step 3.5】: Modality Dropout (语义丢弃)
-        # =======================================================
-        # 逻辑：在训练时，以 40% 的概率将语义特征强行置零。
-        # 目的：欺骗门控网络和分类器，让它们以为语义流失效了，
-        #       从而被迫去挖掘 v_forensic (物理流) 中的有用信息。
-        # f_sem_for_fusion = f_sem_raw
+        # 频率流
+        if self.ablation_mode in ['freq_only', 'naive_concat', 'with_ssfa', 'full']:
+            z_freq = self.branch3(img)
+            # z_freq_global = z_freq.mean(dim=1) # 备用
 
-        # if self.training:
-        #     # 概率建议设为 0.3 - 0.5。这里设为 0.4 (40% 概率丢弃语义)
-        #     if torch.rand(1).item() < 0.5:
-        #         f_sem_for_fusion = torch.zeros_like(f_sem_raw)
-        # =======================================================
-        alpha = None
-        beta = None
-        # 3. 最终融合决策 (Strategy Switch)
-        if self.fusion_type == 'discrepancy':
-            # 情况1：传入 语义向量 + 取证序列特征
-            final_feat = self.adv_fusion(f_sem_raw, x_seq)
+        # ==========================================
+        # 2. 物理互证阶段 (SSFA)
+        # ==========================================
+        if self.ablation_mode in ['with_ssfa', 'full']:
+            # 使用 SSFA 提纯物理特征
+            v_forensic, _, attn_weights = self.ssfa(f_loc, z_freq)
+        elif self.ablation_mode == 'naive_concat':
+            # 不使用 SSFA，v_forensic 尚未生成，后续直接拼接原始特征
+            pass
 
-        elif self.fusion_type == 'gating':
-            # 情况2：传入 语义向量 + 取证聚合向量
-            # final_feat, alpha = self.adv_fusion(f_sem_raw, v_forensic)
-            final_feat, alpha, beta = self.adv_fusion(f_sem_raw, v_forensic)
+        # ==========================================
+        # 3. 融合与决策阶段
+        # ==========================================
+        final_feat = None
 
-        else:
-            # 默认：简单拼接
+        # --- A. 单支路模式 ---
+        if self.ablation_mode == 'semantic_only':
+            final_feat = f_sem_raw
+        elif self.ablation_mode == 'texture_only':
+            final_feat = f_tex_global
+        elif self.ablation_mode == 'freq_only':
+            # 频域序列做 GAP
+            final_feat = z_freq.mean(dim=1)
+
+        # --- B. 朴素三支路拼接 (无 SSFA, 无 CIGF) ---
+        elif self.ablation_mode == 'naive_concat':
+            # 拼接：语义 + 全局纹理 + 全局频率
+            # [B, D] + [B, D] + [B, D] -> [B, 3D]
+            z_freq_global = z_freq.mean(dim=1)
+            final_feat = torch.cat([f_sem_raw, f_tex_global, z_freq_global], dim=1)
+
+        # --- C. 引入 SSFA (拼接融合) ---
+        elif self.ablation_mode == 'with_ssfa':
+            # 拼接：语义 + SSFA提纯后的物理向量
+            # [B, D] + [B, D] -> [B, 2D]
             final_feat = torch.cat([f_sem_raw, v_forensic], dim=1)
-        # --- Step 5: 最终分类 ---
+
+        # --- D. 完整模型 (CIGF 动态门控) ---
+        elif self.ablation_mode == 'full':
+            # 使用 CIGF 融合
+            if self.fusion_type == 'gating':
+                final_feat, alpha, beta = self.adv_fusion(f_sem_raw, v_forensic)
+            elif self.fusion_type == 'discrepancy':
+                # 兼容差异融合
+                # 需要 x_seq (SSFA 的未池化输出)，这里简化处理，假设 ssfa 返回了它
+                # 如需严格复现 discrepancy，需修改 ssfa 返回值
+                final_feat = self.adv_fusion(f_sem_raw, v_forensic)
+            else:
+                final_feat = torch.cat([f_sem_raw, v_forensic], dim=1)
+
+        # ==========================================
+        # 4. 分类输出
+        # ==========================================
         logits = self.classifier(final_feat)
 
         return logits, z_sem_norm, attn_weights, f_sem_raw, v_forensic, alpha, beta, f_tex_global, z_freq

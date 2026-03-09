@@ -9,23 +9,31 @@ device: 'cuda'
 batch_size: 256   # 512
 lr: 0.0001        # 0.0001
 epochs: 30
-temp: 0.07  # SupCon 温度系数
-lambda_supcon: 0 # 语义聚类损失权重 0.5
 save_path: './checkpoints'
 logs_path: './logs'
 resume_epoch: 20 # 举例：你想从第 {resume_epoch} epoch 继续，{不包括resume_epoch}，{从resume_epoch}+1开始;重新开始为0
-#exp_name: exp_20260304_195607_seed3407
+#exp_name: exp_20260309_152847_seed3407
 use_lora: True    # 是否使用 LoRA 微调，False 则为解冻少部分参数。建议使用 True
-# 可选值: 'concat' | 'discrepancy' | 'gating'
+# --- 消融实验控制开关 ---
+# 可选值:
+# 'full'           : 完整模型 (CIGF + SSFA + All Losses)
+# 'semantic_only'  : 仅语义支路 (ViT)
+# 'texture_only'   : 仅纹理支路 (ResNet+Patch)
+# 'freq_only'      : 仅频域支路 (Band-CNN)
+# 'naive_concat'   : 三支路简单拼接 (无 SSFA, 无 CIGF)
+# 'with_ssfa'      : 拼接 + SSFA (无 CIGF)
+ablation_mode: 'semantic_only'# --- 消融实验控制开关 ---
+# 融合策略 (配合 ablation_mode 使用)
+# 对应 naive_concat 或 with_ssfa 时建议设为 'concat'
+# 对应 full 时设为 'gating'
 fusion_type: 'gating'
-# 正交损失权重 (仅在 gating 模式下生效)
-lambda_decorr: 0.001
-#lambda_l1: 0.0001
-lambda_div: 0.01
+# (仅在 gating 模式下生效)损失函数权重 (消融实验中控制变量)
+lambda_decorr: 0.001  # 验证 L_dec 时设为 0
+lambda_div: 0.01      # 验证 L_div 时设为 0
 # 推理：
 # 验证集目录，多个用','隔开
 VAL_DIRS: "/root/autodl-tmp/data/val,/root/autodl-tmp/adm/val,/root/autodl-tmp/biggan/val,/root/autodl-tmp/glide/val,/root/autodl-tmp/midjourney/val,/root/autodl-tmp/sdv5/val,/root/autodl-tmp/vqdm/val,/root/autodl-tmp/wukong/val"
 # 模型权重目录，默认目录下所有权重文件，
-CHECKPOINT_DIR: "/root/autodl-tmp/detection/checkpoints/exp_20260304_195607_seed3407"
+CHECKPOINT_DIR: "/root/autodl-tmp/detection/checkpoints/exp_20260309_152847_seed3407"
 # 模型权重目录下的epoch权重，只使用这一个，注释掉使用所有
 CHECKPOINT_EPOCH: 30
