@@ -1,4 +1,5 @@
-clip_model: "/root/autodl-tmp/detection/models/clip-vit-base-patch32/" # clip-vit-base-patch32
+# clip-vit-base-patch32、clip-vit-base-patch16、clip-vit-large-patch14
+clip_model: "/root/autodl-tmp/detection/models/clip-vit-base-patch32/"
 #clip_dim: 512
 projection_dim: 256
 patch_size: 32
@@ -12,7 +13,7 @@ epochs: 30
 save_path: './checkpoints'
 logs_path: './logs'
 resume_epoch: 20 # 举例：你想从第 {resume_epoch} epoch 继续，{不包括resume_epoch}，{从resume_epoch}+1开始;重新开始为0
-#exp_name: exp_20260309_152847_seed3407
+#exp_name: exp_20260309_210231_seed3407semantic_only
 use_lora: True    # 是否使用 LoRA 微调，False 则为解冻少部分参数。建议使用 True
 # --- 消融实验控制开关 ---
 # 可选值:
@@ -22,7 +23,7 @@ use_lora: True    # 是否使用 LoRA 微调，False 则为解冻少部分参数
 # 'freq_only'      : 仅频域支路 (Band-CNN)
 # 'naive_concat'   : 三支路简单拼接 (无 SSFA, 无 CIGF)
 # 'with_ssfa'      : 拼接 + SSFA (无 CIGF)
-ablation_mode: 'semantic_only'# --- 消融实验控制开关 ---
+ablation_mode: 'full'# --- 消融实验控制开关 ---
 # 融合策略 (配合 ablation_mode 使用)
 # 对应 naive_concat 或 with_ssfa 时建议设为 'concat'
 # 对应 full 时设为 'gating'
@@ -32,7 +33,7 @@ lambda_decorr: 0.001  # 验证 L_dec 时设为 0
 lambda_div: 0.01      # 验证 L_div 时设为 0
 # 推理：
 # 验证集目录，多个用','隔开
-VAL_DIRS: "/root/autodl-tmp/data/val,/root/autodl-tmp/adm/val,/root/autodl-tmp/biggan/val,/root/autodl-tmp/glide/val,/root/autodl-tmp/midjourney/val,/root/autodl-tmp/sdv5/val,/root/autodl-tmp/vqdm/val,/root/autodl-tmp/wukong/val"
+VAL_DIRS: "/root/autodl-tmp/midjourney/val,/root/autodl-tmp/data/val,/root/autodl-tmp/sdv5/val,/root/autodl-tmp/adm/val,/root/autodl-tmp/glide/val,/root/autodl-tmp/wukong/val,/root/autodl-tmp/vqdm/val,/root/autodl-tmp/biggan/val"
 # 模型权重目录，默认目录下所有权重文件，
 CHECKPOINT_DIR: "/root/autodl-tmp/detection/checkpoints/exp_20260309_152847_seed3407"
 # 模型权重目录下的epoch权重，只使用这一个，注释掉使用所有

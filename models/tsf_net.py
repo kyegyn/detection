@@ -124,7 +124,7 @@ class TSFNet(nn.Module):
         # ==========================================
         if self.ablation_mode in ['with_ssfa', 'full']:
             # 使用 SSFA 提纯物理特征
-            v_forensic, _, attn_weights = self.ssfa(f_loc, z_freq)
+            v_forensic, _, attn_weights = self.fusion(f_loc, z_freq)
         elif self.ablation_mode == 'naive_concat':
             # 不使用 SSFA，v_forensic 尚未生成，后续直接拼接原始特征
             pass
